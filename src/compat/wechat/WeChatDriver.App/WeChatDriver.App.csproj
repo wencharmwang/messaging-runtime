@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <RootNamespace>WeChatDriver.App</RootNamespace>
+    <AssemblyName>WeChatDriver.App</AssemblyName>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../../providers/wechat/windows/WeChatDriver.Core/WeChatDriver.Core.csproj" />
+    <ProjectReference Include="../../../providers/wechat/windows/WeChatDriver.Windows/WeChatDriver.Windows.csproj" />
+    <ProjectReference Include="../../../providers/wechat/windows/WeChatDriver.UIA/WeChatDriver.UIA.csproj" />
+    <ProjectReference Include="../../../providers/wechat/windows/WeChatDriver.Automation/WeChatDriver.Automation.csproj" />
+    <ProjectReference Include="../WeChatDriver.AgentBridge/WeChatDriver.AgentBridge.csproj" />
+    <ProjectReference Include="../WeChatDriver.Mcp/WeChatDriver.Mcp.csproj" />
+    <ProjectReference Include="../WeChatDriver.Store/WeChatDriver.Store.csproj" />
+    <ProjectReference Include="../../../providers/wechat/windows/WeChatDriver.Capture/WeChatDriver.Capture.csproj" />
+    <ProjectReference Include="../WeChatDriver.Bench/WeChatDriver.Bench.csproj" />
+  </ItemGroup>
+</Project>

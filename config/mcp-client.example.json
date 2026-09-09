@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "messaging-runtime": {
+      "command": "dotnet",
+      "args": [
+        "<PROJECT_ROOT>/artifacts/app/messaging-runtime.dll",
+        "--stdio",
+        "--config",
+        "<PROJECT_ROOT>/config/messaging-runtime.example.json"
+      ]
+    }
+  }
+}

@@ -1,0 +1,27 @@
+# All build, test and distribution outputs
+artifacts/
+**/bin/
+**/obj/
+TestResults/
+dist/
+publish/
+
+# Local messages, approvals, machine-specific client configuration
+.runtime-data/
+*.db
+*.db-shm
+*.db-wal
+*.log
+config/*.local.json
+
+# Portable third-party binaries are retained locally, not source controlled
+runtime/python/
+**/__pycache__/
+*.py[cod]
+.vs/
+.workbuddy/
+
+# Credentials
+.env
+.env.*
+*.token

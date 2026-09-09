@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <RootNamespace>WeChatDriver.UIA</RootNamespace>
+    <AssemblyName>WeChatDriver.UIA</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.WindowsDesktop.App" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../WeChatDriver.Core/WeChatDriver.Core.csproj" />
+    <ProjectReference Include="../WeChatDriver.Windows/WeChatDriver.Windows.csproj" />
+  </ItemGroup>
+</Project>

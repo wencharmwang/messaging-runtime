@@ -1,0 +1,20 @@
+# Automatic replies have no shell/editor capabilities. They return a decision to Runtime.
+- id: persistent-bash
+  disabled: true
+- id: persistent-pwsh
+  disabled: true
+- id: str-replace-editor
+  disabled: true
+- id: sandbox-policy
+  config:
+    mode: read-only
+- id: agent-spine
+  config:
+    includeHarnessIdentity: false
+    includeRuntimeContext: false
+    persona: !!js process.env.DSH_SYSTEM_PROMPT
+    workspaceContext: false
+    toolBash: false
+    toolJobs: false
+    skills:
+      enabled: false

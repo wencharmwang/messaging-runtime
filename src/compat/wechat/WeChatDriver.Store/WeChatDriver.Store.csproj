@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <RootNamespace>WeChatDriver.Store</RootNamespace>
+    <AssemblyName>WeChatDriver.Store</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.10" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../../providers/wechat/windows/WeChatDriver.Core/WeChatDriver.Core.csproj" />
+  </ItemGroup>
+</Project>

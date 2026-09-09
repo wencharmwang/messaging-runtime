@@ -1,0 +1,18 @@
+{
+  "agent_id": "local-agent",
+  "data_directory": "../.runtime-data",
+  "approval_ui": "desktop",
+  "wechat_write_mode": "background",
+  "auto_reply_database": "../../message-agent/data/reply.db",
+  "auto_reply_token_file": "../../message-agent/data/worker.token",
+  "policy": {
+    "send_mode": "user_directed",
+    "max_text_length": 4000,
+    "allow_send": []
+  },
+  "providers": [
+    { "id": "wechat-main", "type": "wechat", "display_name": "My WeChat" },
+    { "id": "whatsapp-main", "type": "whatsapp", "display_name": "WhatsApp (extension)" },
+    { "id": "telegram-main", "type": "telegram", "display_name": "Telegram (extension)" }
+  ]
+}

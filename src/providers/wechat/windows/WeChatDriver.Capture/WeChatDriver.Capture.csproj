@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <RootNamespace>WeChatDriver.Capture</RootNamespace>
+    <AssemblyName>WeChatDriver.Capture</AssemblyName>
+    <UseWindowsForms>true</UseWindowsForms>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../WeChatDriver.Core/WeChatDriver.Core.csproj" />
+    <ProjectReference Include="../WeChatDriver.Windows/WeChatDriver.Windows.csproj" />
+  </ItemGroup>
+</Project>

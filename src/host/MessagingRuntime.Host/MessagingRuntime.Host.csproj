@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <AssemblyName>messaging-runtime</AssemblyName>
+    <UseWindowsForms>true</UseWindowsForms>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../mcp/MessagingRuntime.Mcp/MessagingRuntime.Mcp.csproj" />
+    <ProjectReference Include="../../providers/wechat/MessagingRuntime.Providers.WeChat/MessagingRuntime.Providers.WeChat.csproj" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,24 @@
+{
+  "Source": "C:\\Users\\Wencharm\\WorkBuddy\\wechat_use",
+  "Destination": "C:\\Users\\Wencharm\\Documents\\projects\\messaging-runtime",
+  "RetainedFiles": 3212,
+  "ProjectCount": 21,
+  "PlannedDeletionFiles": 10835,
+  "PlannedRemovalBytes": 1625070180.0,
+  "DeletedBuildArtifactFiles": 3461,
+  "RemovedBuildArtifactBytes": 874906677.0,
+  "CleanupStatus": "complete_except_empty_directory_held_by_current_task",
+  "TestsPassed": 110,
+  "CompletedAtUtc": "2026-09-03T10:45:32.9036349+08:00",
+  "OldDirectoryRemoved": false,
+  "StoppedOrphanOcrProcessIds": [
+    14112,
+    16316
+  ],
+  "BuildWarnings": 0,
+  "BuildErrors": 0,
+  "DataMigrationComplete": true,
+  "OldDirectoryEmpty": true,
+  "DeletedObsoleteFiles": 10835,
+  "RemovedObsoleteBytes": 1625070180.0
+}

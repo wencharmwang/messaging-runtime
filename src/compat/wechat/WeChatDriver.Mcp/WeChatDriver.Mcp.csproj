@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <RootNamespace>WeChatDriver.Mcp</RootNamespace>
+    <AssemblyName>WeChatDriver.Mcp</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../../providers/wechat/windows/WeChatDriver.Core/WeChatDriver.Core.csproj" />
+    <ProjectReference Include="../../../providers/wechat/windows/WeChatDriver.Automation/WeChatDriver.Automation.csproj" />
+  </ItemGroup>
+</Project>

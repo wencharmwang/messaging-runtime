@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <RootNamespace>WeChatDriver.AgentBridge</RootNamespace>
+    <AssemblyName>WeChatDriver.AgentBridge</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../../providers/wechat/windows/WeChatDriver.Core/WeChatDriver.Core.csproj" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,21 @@
+{
+  "profileId": "wechat-win-4.1.13.12-dpi120-layout1",
+  "clientVersion": "4.1.13.12",
+  "dpi": 120,
+  "windowBounds": { "width": 1118, "height": 809 },
+  "requiredCapabilities": [
+    "window_discoverable",
+    "ocr_chinese_available",
+    "send_button_locatable"
+  ],
+  "uiaSelectors": {},
+  "fallbackRegions": {
+    "conversationList": { "x": 0.04, "y": 0.06, "width": 0.26, "height": 0.30 },
+    "chatTitle": { "x": 0.30, "y": 0.02, "width": 0.50, "height": 0.05 },
+    "latestMessageArea": { "x": 0.30, "y": 0.55, "width": 0.55, "height": 0.18 },
+    "composer": { "x": 0.30, "y": 0.70, "width": 0.70, "height": 0.22 },
+    "sendButton": { "x": 0.93, "y": 0.93, "width": 0.06, "height": 0.05 }
+  },
+  "sendStrategy": "ocr_enter",
+  "notes": "WeChat 4.x uses Qt custom rendering (MMUIRenderSubWindowHW). UIA tree exposes ONLY window chrome (titlebar, min/max/close). Chat content, conversation list, composer, and send button are NOT exposed via UIA. All reads require PrintWindow + Windows.Media.Ocr (zh-Hans). Writes require clipboard + Ctrl+V."
+}
