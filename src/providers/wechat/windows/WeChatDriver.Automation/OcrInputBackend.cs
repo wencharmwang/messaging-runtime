@@ -108,32 +108,16 @@ public sealed class OcrInputBackend : IWindowAutomationBackend
         try
         {
             using var bitmap=CaptureListRegion();
-            var png=WindowCapture.ToPng(bitmap);
-            var native=System.Diagnostics.Stopwatch.StartNew();
-            var plain=_ocr.RecognizePngWithRects(png);
-            native.Stop();
-            // Upscaling is the cheap accuracy knob: the standalone probe reads a name like
-            // 新爱书（小规模）&灏天来财税 completely at 2x, while the native-resolution read
-            // sometimes returns only the second half of the same box.
-            var big=System.Diagnostics.Stopwatch.StartNew();
-            IReadOnlyList<OcrTextRect> upscaled;
-            using (var enlarged=new System.Drawing.Bitmap(bitmap.Width*2,bitmap.Height*2))
-            {
-                using (var graphics=System.Drawing.Graphics.FromImage(enlarged))
-                {
-                    graphics.InterpolationMode=System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
-                    graphics.DrawImage(bitmap,0,0,enlarged.Width,enlarged.Height);
-                }
-                upscaled=_ocr.RecognizePngWithRects(WindowCapture.ToPng(enlarged));
-            }
-            big.Stop();
-            static object[] Shape(IReadOnlyList<OcrTextRect> rects)=>
-                rects.OrderBy(r=>r.Y).ThenBy(r=>r.X).Take(40)
-                    .Select(r=>new { t=r.Text.Trim(),x=r.X,y=r.Y,w=r.Width,h=r.Height }).ToArray();
+            var started=System.Diagnostics.Stopwatch.StartNew();
+            var rects=_ocr.RecognizePngWithRects(WindowCapture.ToPng(bitmap));
+            started.Stop();
+            // A single pass on purpose: this diagnostic gets polled while chasing a flicker, so it
+            // has to stay as cheap as the read path it describes.
             return new object[]
             {
-                new { scale="1x", ms=native.ElapsedMilliseconds, rects=Shape(plain) },
-                new { scale="2x", ms=big.ElapsedMilliseconds, rects=Shape(upscaled) }
+                new { scale="1x", ms=started.ElapsedMilliseconds,
+                      rects=rects.OrderBy(r=>r.Y).ThenBy(r=>r.X).Take(40)
+                          .Select(r=>new { t=r.Text.Trim(),x=r.X,y=r.Y,w=r.Width,h=r.Height }).ToArray() }
             };
         }
         catch (Exception error) { return new object[] { error.GetType().Name }; }
@@ -592,7 +576,7 @@ public sealed class OcrInputBackend : IWindowAutomationBackend
             var rows = ReadConversationRows();
             var row = ConversationListLocator.Unique(rows, displayName)
                 ?? throw new WindowAutomationException("conversation_not_visible",
-                    "The requested conversation is not in the visible list. Scroll the conversation list manually and retry.");
+                    $"The requested conversation is not in the visible list. Scroll the conversation list manually and retry. Visible rows: {ConversationListLocator.Describe(rows)}");
             Input.Click(Layout.List.Left + row.X, Layout.List.Top + row.Y);
             // 必须核对标题：列表可能在取坐标与点击之间重排，点错行就会把消息发错人。
             if (WaitForConversationTitle(displayName, 3000))
@@ -846,7 +830,8 @@ public sealed class OcrInputBackend : IWindowAutomationBackend
     /// </summary>
     private bool WaitForConversationTitle(string displayName, int maxWaitMs)
     {
-        var wanted = MessageFingerprint.Normalize(displayName).ToLowerInvariant();
+        var wanted = MessageFingerprint.NameKey(displayName).ToLowerInvariant();
+        if (wanted.Length == 0) return false;
         var deadline = DateTime.UtcNow.AddMilliseconds(maxWaitMs);
         do
         {
@@ -856,8 +841,9 @@ public sealed class OcrInputBackend : IWindowAutomationBackend
                 ObserveLayout();
                 if (ReadHeaderLines().Any(line =>
                     {
-                        var text = MessageFingerprint.Normalize(line).ToLowerInvariant();
-                        return text.Length > 0 && text.Contains(wanted, StringComparison.Ordinal);
+                        var bare=ConversationListLocator.BareName(line);
+                        return MessageFingerprint.NameKey(bare).ToLowerInvariant().Contains(wanted, StringComparison.Ordinal)
+                            || ConversationListLocator.ApproximatelySame(bare,displayName);
                     }))
                     return true;
             }
@@ -1023,7 +1009,8 @@ public sealed class OcrInputBackend : IWindowAutomationBackend
             ObserveListLayout();
             var rows=ReadConversationRows();
             var row=ConversationListLocator.Unique(rows,displayName)
-                ?? throw new WindowAutomationException("conversation_not_visible","The requested conversation is not in the visible list. Scroll the conversation list manually and retry.");
+                ?? throw new WindowAutomationException("conversation_not_visible",
+                    $"The requested conversation is not in the visible list. Scroll the conversation list manually and retry. Visible rows: {ConversationListLocator.Describe(rows)}");
             Input.Click(Layout.List.Left+row.X,Layout.List.Top+row.Y);
             // 校验标题而不只是「布局可用」：会话列表在 OCR 取坐标与点击之间会因新消息重排，
             // 点错行就会静默读到别人的聊天内容（实测发生过：群消息出现在 direct 规则下）。

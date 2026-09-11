@@ -102,16 +102,19 @@ public sealed class WindowsWeChatDriver(Func<OcrInputBackend> factory) : IWeChat
         if (string.IsNullOrWhiteSpace(header)) return false;
         if (HeaderIsExactly(header, rowName)) return true;
         var bare=ConversationListLocator.BareName(header!);
-        return bare.Length>0&&(bare.Contains(rowName,StringComparison.Ordinal)||rowName.Contains(bare,StringComparison.Ordinal));
+        var key=MessageFingerprint.NameKey(bare);
+        var wanted=MessageFingerprint.NameKey(rowName);
+        return key.Length>0&&wanted.Length>0&&(key.Contains(wanted,StringComparison.Ordinal)||wanted.Contains(key,StringComparison.Ordinal));
     }
 
     /// <summary>
     /// Strict: the open chat IS this conversation. Used to skip a row click, so a loose match
     /// would risk reading a different conversation — the member count is the only allowance.
+    /// Compared on the name key, because OCR writes spaces inside a CJK name.
     /// </summary>
     private static bool HeaderIsExactly(string? header, string rowName) =>
         !string.IsNullOrWhiteSpace(header) &&
-        MessageFingerprint.Normalize(ConversationListLocator.BareName(header!)) == MessageFingerprint.Normalize(rowName);
+        MessageFingerprint.NameKey(ConversationListLocator.BareName(header!)) == MessageFingerprint.NameKey(rowName);
 
     private string? DisplacedChat(bool allowGlobalSearch)
     {

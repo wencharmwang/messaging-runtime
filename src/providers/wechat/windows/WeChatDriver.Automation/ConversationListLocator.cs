@@ -132,9 +132,45 @@ public static class ConversationListLocator
 
     public static ConversationRow? Unique(IReadOnlyList<ConversationRow> rows,string name)
     {
-        var expected=MessageFingerprint.Normalize(name);
-        var matches=rows.Where(r=>MessageFingerprint.Normalize(r.Name)==expected).ToArray();
-        if(matches.Length>1) throw new WeChatDriver.Windows.WindowAutomationException("ambiguous_conversation","Several visible conversation rows have the same name.");
-        return matches.SingleOrDefault();
+        // Compared on NameKey, not Normalize: the OCR engine writes spaces inside a CJK run, so
+        // the same row reads as "小璐璐" on one frame and "小 璐 璐" on the next, and an exact
+        // string comparison then reports the conversation as missing from its own list.
+        var expected=MessageFingerprint.NameKey(name);
+        if(expected.Length==0) return null;
+        var matches=rows.Where(r=>MessageFingerprint.NameKey(r.Name)==expected).ToArray();
+        if(matches.Length>0) return matches.SingleOrDefault() ?? throw new WeChatDriver.Windows.WindowAutomationException("ambiguous_conversation","Several visible conversation rows have the same name.");
+        // Nothing matched exactly: accept a single row that is one character off. Never guess
+        // between two candidates — reporting the miss is better than reading the wrong chat.
+        var near=rows.Where(r=>ApproximatelySame(r.Name,name)).ToArray();
+        if(near.Length>1) throw new WeChatDriver.Windows.WindowAutomationException("ambiguous_conversation","Several visible conversation rows are close to the requested name.");
+        return near.SingleOrDefault();
     }
+
+    /// <summary>
+    /// Two reads of the same row can differ by one extra character: the OCR engine returned both
+    /// "小璐璐" and "小璐路璐" for one chat, and an exact match then reports that conversation as
+    /// missing from its own list. Only an inserted or dropped character counts — a substitution
+    /// is deliberately not accepted, because two conversations whose names differ by a single
+    /// character would otherwise be silently conflated.
+    /// </summary>
+    public static bool ApproximatelySame(string left,string right)
+    {
+        var a=MessageFingerprint.NameKey(left);
+        var b=MessageFingerprint.NameKey(right);
+        if(a.Length<3||b.Length<3||Math.Abs(a.Length-b.Length)!=1) return false;
+        var (shorter,longer)=a.Length<b.Length?(a,b):(b,a);
+        int i=0,j=0;
+        var skipped=false;
+        while(i<shorter.Length&&j<longer.Length)
+        {
+            if(shorter[i]==longer[j]) { i++; j++; }
+            else if(skipped) return false;
+            else { skipped=true; j++; }
+        }
+        return true;
+    }
+
+    /// <summary>What the row scan actually produced, for an error a person can act on.</summary>
+    public static string Describe(IReadOnlyList<ConversationRow> rows) =>
+        string.Join(" / ",rows.Where(r=>r.Name.Length>0).Select(r=>r.Name).Distinct().Take(12));
 }
