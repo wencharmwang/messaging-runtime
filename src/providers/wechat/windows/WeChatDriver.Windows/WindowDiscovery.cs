@@ -87,6 +87,85 @@ public sealed class WindowDiscovery
         return candidates.Count == 0 ? [] : [candidates[0]];
     }
 
+    /// <summary>
+    /// 找到微信主窗口，**不要求它当前可见**。
+    /// 用户把微信最小化到托盘时窗口是 hidden 的，普通 <see cref="Discover"/> 会判定不可用；
+    /// 用户主动下令的发送允许把窗口拉回来，所以需要先能定位到它。
+    /// 主窗口的 class 是 Qt…QWindowIcon，与搜索浮层（QWindowToolSaveBits）和托盘窗口都不冲突。
+    /// </summary>
+    public static nint FindMainWindowLoose(int pid)
+    {
+        using var dpi = new DpiAwarenessScope();
+        nint best = nint.Zero;
+        long bestArea = 0;
+        NativeMethods.EnumWindows((hWnd, _) =>
+        {
+            NativeMethods.GetWindowThreadProcessId(hWnd, out var owner);
+            if ((int)owner != pid) return true;
+            var sb = new StringBuilder(256);
+            if (NativeMethods.GetClassName(hWnd, sb, sb.Capacity) <= 0) return true;
+            if (!sb.ToString().Contains("QWindowIcon", StringComparison.Ordinal)) return true;
+            NativeMethods.GetWindowRect(hWnd, out var rect);
+            var area = (long)rect.Width * rect.Height;
+            if (area <= bestArea) return true;
+            bestArea = area;
+            best = hWnd;
+            return true;
+        }, nint.Zero);
+        return best;
+    }
+
+    /// <summary>窗口是否既可见又未最小化（后台输入的前提）。</summary>
+    public static bool IsWindowUsable(nint hwnd) =>
+        hwnd != nint.Zero && NativeMethods.IsWindowVisible(hwnd) && !NativeMethods.IsIconic(hwnd);
+
+    /// <summary>
+    /// 依次尝试把窗口恢复成可见且非最小化。隐藏到托盘（IsWindowVisible=false）需要用
+    /// SW_SHOWNOACTIVATE/SW_SHOW，最小化到任务栏则需要 SW_RESTORE；每级之后都实际校验。
+    /// </summary>
+    public static bool TryRestoreWindow(nint hwnd)
+    {
+        foreach (var command in new[]
+                 {
+                     NativeMethods.SwShowNoActivate, NativeMethods.SwShowNormal,
+                     NativeMethods.SwShow, NativeMethods.SwRestore
+                 })
+        {
+            NativeMethods.ShowWindow(hwnd, command);
+            Thread.Sleep(400);
+            if (IsWindowUsable(hwnd)) return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// 定位微信全局搜索的建议/结果浮层。
+    /// 它不是主窗口的子窗口，而是同进程的独立顶层窗口（class 含 QWindowToolSaveBits），
+    /// 且**每次都会被重建、句柄每次都不同**，所以调用方必须在每轮操作前重新发现，不能缓存。
+    /// </summary>
+    public static nint FindSearchPopup(int pid)
+    {
+        using var dpi = new DpiAwarenessScope();
+        nint best = nint.Zero;
+        long bestArea = 0;
+        NativeMethods.EnumWindows((hWnd, _) =>
+        {
+            if (!NativeMethods.IsWindowVisible(hWnd)) return true;
+            NativeMethods.GetWindowThreadProcessId(hWnd, out var owner);
+            if ((int)owner != pid) return true;
+            var sb = new StringBuilder(256);
+            if (NativeMethods.GetClassName(hWnd, sb, sb.Capacity) <= 0) return true;
+            if (!sb.ToString().Contains("QWindowToolSaveBits", StringComparison.Ordinal)) return true;
+            NativeMethods.GetWindowRect(hWnd, out var rect);
+            var area = (long)rect.Width * rect.Height;
+            if (area <= bestArea) return true;
+            bestArea = area;
+            best = hWnd;
+            return true;
+        }, nint.Zero);
+        return best;
+    }
+
     public static Version? GetProcessFileVersion(int pid)
     {
         try

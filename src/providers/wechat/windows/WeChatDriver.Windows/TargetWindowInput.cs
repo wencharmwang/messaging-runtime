@@ -18,6 +18,8 @@ public interface IWindowInputNative
     void Wheel(nint hwnd, int x, int y, int delta, bool background);
     void Chord(nint hwnd, ushort[] keys);
     void Character(nint hwnd, int x, int y, char value) => throw new WindowAutomationException("background_text_unsupported", "Background text input is unavailable.");
+    /// <summary>Post a single virtual key (down+up) to the window's own queue. No focus needed.</summary>
+    void Key(nint hwnd, ushort virtualKey) => throw new WindowAutomationException("background_key_unsupported", "Background key input is unavailable.");
 }
 
 /// <summary>Coordinates are window-local physical pixels. Every event revalidates the bound HWND/PID and geometry.</summary>
@@ -49,7 +51,11 @@ public sealed class TargetWindowInput(nint hwnd, int processId, IWindowInputNati
     public void ActivateForWriting()
     {
         Validate();
-        _native.Activate(hwnd);
+        // SetForegroundWindow alone is refused for background processes often enough to
+        // matter, so use the guarded ladder instead of the single call.
+        if (!InputHelper.TryActivate(hwnd))
+            throw new WindowAutomationException("foreground_unavailable",
+                "WeChat could not be brought to the foreground, so no real input was sent.");
         RequireForeground();
     }
 
@@ -93,6 +99,9 @@ public sealed class TargetWindowInput(nint hwnd, int processId, IWindowInputNati
         RequireForeground();
         _native.Chord(hwnd, keys);
     }
+
+    /// <summary>Post one virtual key to the window queue. Works without the foreground.</summary>
+    public void SendVirtualKey(ushort virtualKey) => _native.Key(hwnd, virtualKey);
 
     public void WriteText(int x, int y, string text, Action verifyTarget)
     {
@@ -207,6 +216,15 @@ internal sealed class Win32WindowInput(int expectedProcessId) : IWindowInputNati
     {
         using var dpi = new DpiAwarenessScope();
         Deliver(hwnd,hwnd,0x0102,value,1); // Qt routes top-level keyboard events to its focused widget.
+    }
+
+    public void Key(nint hwnd,ushort virtualKey)
+    {
+        using var dpi = new DpiAwarenessScope();
+        // Same routing as Character: Qt receives the posted key on its focused widget,
+        // so this works without the window being foreground. Used for Escape cleanup.
+        Deliver(hwnd,hwnd,0x0100,virtualKey,0x00010001); // WM_KEYDOWN
+        Deliver(hwnd,hwnd,0x0101,virtualKey,unchecked((nint)0xC0010001UL)); // WM_KEYUP
     }
 
 }

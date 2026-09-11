@@ -137,6 +137,97 @@ public static class InputHelper
     /// <summary>前台化窗口。</summary>
     public static bool BringToForeground(IntPtr hwnd) => SetForegroundWindow(hwnd);
 
+    /// <summary>目标窗口当前是否为前台窗口。</summary>
+    public static bool IsForeground(nint hwnd) => GetForegroundWindow() == hwnd;
+
+    /// <summary>当前前台窗口句柄，供调用方在临时抢前台后还原。</summary>
+    public static nint CurrentForeground() => GetForegroundWindow();
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NativePoint { public int X, Y; }
+
+    [DllImport("user32.dll")]
+    private static extern bool GetCursorPos(out NativePoint point);
+
+    /// <summary>当前光标屏幕坐标，供调用方在真实点击后还原。</summary>
+    public static (int X, int Y) CursorPosition() => GetCursorPos(out var p) ? (p.X, p.Y) : (0, 0);
+
+    /// <summary>把光标移回原位。</summary>
+    public static void MoveCursor(int x, int y) => SetCursorPos(x, y);
+
+    /// <summary>
+    /// 尽力把窗口切到前台。Windows 只允许「前台进程」或「刚收到过输入事件」的进程调用
+    /// SetForegroundWindow，后台服务进程会间歇性被拒（实测约半数失败），故逐级兜底；
+    /// 每级之后都实际校验前台窗口，全部失败返回 false（调用方不得继续发真实输入）。
+    /// </summary>
+    public static bool TryActivate(nint hwnd)
+    {
+        if (IsForeground(hwnd)) return true;
+
+        // 1) 直接请求。
+        SetForegroundWindow(hwnd);
+        if (Settle(hwnd)) return true;
+
+        // 2) 轻敲 ALT：让本进程被记为「最近一次输入事件」的接收者，随后请求通常被接受。
+        TapKey(NativeMethods.VkMenu);
+        NativeMethods.SetForegroundWindow(hwnd);
+        if (Settle(hwnd)) return true;
+
+        // 3) 与当前前台线程共享输入队列后再请求。
+        var foreground = NativeMethods.GetForegroundWindow();
+        var foregroundThread = foreground == IntPtr.Zero ? 0 : NativeMethods.GetWindowThreadProcessId(foreground, out _);
+        var attached = foregroundThread != 0 &&
+                       NativeMethods.AttachThreadInput(NativeMethods.GetCurrentThreadId(), foregroundThread, true);
+        try
+        {
+            NativeMethods.SetForegroundWindow(hwnd);
+        }
+        finally
+        {
+            if (attached) NativeMethods.AttachThreadInput(NativeMethods.GetCurrentThreadId(), foregroundThread, false);
+        }
+        if (Settle(hwnd)) return true;
+
+        // 4) 先置顶（不激活）再请求。
+        NativeMethods.SetWindowPos(hwnd, NativeMethods.HwndTop, 0, 0, 0, 0,
+            NativeMethods.SwpNoMove | NativeMethods.SwpNoSize | NativeMethods.SwpNoActivate);
+        NativeMethods.SetForegroundWindow(hwnd);
+        if (Settle(hwnd)) return true;
+
+        // 5) 最小化再还原，绕开前台锁。
+        NativeMethods.ShowWindow(hwnd, NativeMethods.SwMinimize);
+        Thread.Sleep(200);
+        NativeMethods.ShowWindow(hwnd, NativeMethods.SwRestore);
+        Thread.Sleep(300);
+        NativeMethods.SetForegroundWindow(hwnd);
+        return Settle(hwnd);
+    }
+
+    /// <summary>把前台还给调用前的窗口（best effort，失败不影响已完成的发送）。</summary>
+    public static void RestoreForeground(nint previous)
+    {
+        if (previous == IntPtr.Zero || IsForeground(previous)) return;
+        if (!NativeMethods.SetForegroundWindow(previous))
+        {
+            TapKey(NativeMethods.VkMenu);
+            NativeMethods.SetForegroundWindow(previous);
+        }
+    }
+
+    private static bool Settle(nint hwnd)
+    {
+        Thread.Sleep(350);
+        return IsForeground(hwnd);
+    }
+
+    private static void TapKey(byte vk)
+    {
+        NativeMethods.keybd_event(vk, 0, 0, 0);
+        Thread.Sleep(30);
+        NativeMethods.keybd_event(vk, 0, NativeMethods.KeyEventKeyUp, 0);
+        Thread.Sleep(120);
+    }
+
     /// <summary>在屏幕绝对坐标单击。</summary>
     public static void ClickAt(int x, int y)
     {

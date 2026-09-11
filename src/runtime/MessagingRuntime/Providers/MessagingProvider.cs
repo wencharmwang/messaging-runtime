@@ -12,6 +12,22 @@ public abstract class MessagingProvider : IDisposable
     public virtual MessageBatch GetMessages(string conversationId, int limit) => throw Unsupported("read_messages");
     public virtual MessageBatch ObserveLatest(string conversationId, int limit) => throw Unsupported("observe_latest");
     public virtual SendReceipt SendMessage(string conversationId, string text) => throw Unsupported("send_text");
+
+    /// <summary>
+    /// True when a send may target a conversation that is not in the visible list because the
+    /// provider can resolve the recipient itself — e.g. a user-named WeChat contact located
+    /// through WeChat's own global search. Automatic paths keep passing opaque list ids, so
+    /// the strict visible-list identity check still applies to them.
+    /// </summary>
+    public virtual bool AllowsTargetOutsideList(string conversationId) => false;
+
+    /// <summary>
+    /// Bring the platform client window back from minimized or hidden without changing the open
+    /// conversation. Reads and scans never do this on their own: a client the user deliberately
+    /// put away must stay away. Callers that opt in (an explicit user toggle such as the
+    /// Message Agent "自动拉回微信窗口" setting) ask for it explicitly.
+    /// </summary>
+    public virtual void RestoreWindow() => throw Unsupported("restore_window");
     public virtual SendReceipt ReplyMessage(string conversationId, string messageId, string text) => throw Unsupported("reply");
     public virtual SendReceipt SendFile(string conversationId, string path) => throw Unsupported("send_file");
     protected MessagingException Unsupported(string operation) => new("unsupported_capability", $"Provider '{Info.Id}' does not support {operation}.");

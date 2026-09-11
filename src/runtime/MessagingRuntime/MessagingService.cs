@@ -19,6 +19,17 @@ public sealed class MessagingService(ProviderManager providers, MessageStore sto
         return p.ListConversations();
     });
 
+    /// <summary>
+    /// Explicit, opt-in recovery for a client the user (or the tray) minimized. Not part of any
+    /// read path: a scan must never pull a window back on its own, or a user who put WeChat away
+    /// would fight the assistant every polling cycle.
+    /// </summary>
+    public object RestoreWindow(string provider) => Run("restore_window", provider, null, () =>
+    {
+        providers.Get(provider).RestoreWindow();
+        return new { restored = true };
+    });
+
     public UnreadConversations GetUnreadConversations(string provider) => Run("get_unread_conversations", provider, null, () =>
     {
         var p = providers.Get(provider);
@@ -95,10 +106,20 @@ public sealed class MessagingService(ProviderManager providers, MessageStore sto
         {
             var candidates = p.ListConversations().Conversations.Where(c => c.Id == conversationId).ToArray();
             if (candidates.Length == 0)
-                throw new MessagingException("conversation_not_found", "Resolve the recipient with list_conversations before requesting a send.");
-            if (candidates.Length > 1 || (candidates[0].Metadata?.TryGetValue("ambiguous", out var ambiguous) == true && ambiguous == "true"))
-                throw new MessagingException("ambiguous_conversation", "Recipient identity is ambiguous; no send request was created.");
-            request = request with { ConversationTitle = candidates[0].Title };
+            {
+                // A user-commanded send may name a recipient the visible list does not show.
+                // The provider then owns identity: it locates the target (WeChat global search)
+                // and refuses the send if it cannot be verified, so audit the name as the title.
+                if (!p.AllowsTargetOutsideList(conversationId))
+                    throw new MessagingException("conversation_not_found", "Resolve the recipient with list_conversations before requesting a send.");
+                request = request with { ConversationTitle = conversationId };
+            }
+            else
+            {
+                if (candidates.Length > 1 || (candidates[0].Metadata?.TryGetValue("ambiguous", out var ambiguous) == true && ambiguous == "true"))
+                    throw new MessagingException("ambiguous_conversation", "Recipient identity is ambiguous; no send request was created.");
+                request = request with { ConversationTitle = candidates[0].Title };
+            }
         }
         var outcome = store.RegisterSend(request, status);
         store.Audit(new(DateTimeOffset.UtcNow, agentId, "send_origin", provider, conversationId,

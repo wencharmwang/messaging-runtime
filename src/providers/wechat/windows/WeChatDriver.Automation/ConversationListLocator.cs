@@ -4,7 +4,8 @@ using WeChatDriver.Core;
 
 namespace WeChatDriver.Automation;
 
-public sealed record ConversationRow(string Name,int X,int Y,string Preview="",string DisplayTime="",bool HasUnread=false);
+public sealed record ConversationRow(string Name,int X,int Y,string Preview="",string DisplayTime="",bool HasUnread=false,
+    int NameLeft=0,int NameWidth=0,int NameTop=0,int NameHeight=0);
 
 /// <summary>Keep fresh OCR row coordinates with names. Neither search results nor historical list positions are locators.</summary>
 public static class ConversationListLocator
@@ -31,22 +32,86 @@ public static class ConversationListLocator
                 : (anchor.CenterY+anchors[index+1].CenterY)/2;
             var members=sorted.Where(r=>r.CenterY>=upper&&r.CenterY<lower).ToArray();
             var time=members.Select(r=>r.Text.Trim()).FirstOrDefault(IsTime)??"";
+            // The title is often several OCR boxes — a group called 新爱书（小规模）&灏天来财税
+            // came back as "新爱书" / "（小规模）" / "&灏天来财税", and which box ended up first
+            // changed between reads (so the name, and with it the conversation id, changed).
+            // Join everything on the title line into one name and keep the lower lines for the
+            // preview; the identity must be what a person would read off the row.
+            var band=Math.Max(6,Math.Max(anchor.Height/2,dpi/60));
+            var title=members
+                .Where(r=>Math.Abs(r.CenterY-anchor.CenterY)<=band
+                    && r.CenterX>=anchor.X
+                    && !IsTime(r.Text.Trim())
+                    && r.Text.Trim() is not ("搜索" or "Search"))
+                .OrderBy(r=>r.X).ToArray();
+            var rawName=title.Length>0?string.Concat(title.Select(r=>r.Text.Trim())):anchor.Text.Trim();
             var preview=string.Join(" ",members
-                .Where(r=>r.CenterY>anchor.CenterY+Math.Max(2,dpi/60)
+                .Where(r=>r.CenterY>anchor.CenterY+band
                     && r.CenterX>=anchor.X
                     && !IsTime(r.Text.Trim())
                     && r.Text.Trim() is not ("搜索" or "Search"))
                 .OrderBy(r=>r.Y).ThenBy(r=>r.X).Select(r=>r.Text.Trim()));
-            return new ConversationRow(anchor.Text.Trim(),anchor.CenterX,anchor.CenterY,preview,time,
-                bitmap is not null&&HasRedBadge(bitmap,upper,lower,dpi));
+            var (name,inlineTime)=SplitName(rawName);
+            var nameLeft=title.Length>0?title.Min(r=>r.X):anchor.X;
+            var nameRight=title.Length>0?title.Max(r=>r.X+r.Width):anchor.X+anchor.Width;
+            var nameTop=title.Length>0?title.Min(r=>r.Y):anchor.Y;
+            var nameHeight=title.Length>0?title.Max(r=>r.Y+r.Height)-nameTop:anchor.Height;
+            return new ConversationRow(name,anchor.CenterX,anchor.CenterY,preview,time.Length>0?time:inlineTime,
+                bitmap is not null&&HasRedBadge(bitmap,upper,lower,dpi),nameLeft,nameRight-nameLeft,nameTop,nameHeight);
         }).ToArray();
     }
+
+    /// <summary>Exposed so a caller can clean a name it read from a narrower crop.</summary>
+    public static string CleanName(string raw) => SplitName(raw).Name;
+
+    /// <summary>
+    /// A name without the trailing group member count: a chat header reads "新疆羊肉串( 14"
+    /// while the list row says "新疆羊肉串", and comparing those directly never matches.
+    /// </summary>
+    public static string BareName(string text) =>
+        System.Text.RegularExpressions.Regex
+            .Replace((text ?? "").Trim(), @"[（(]\s*\d+\s*[)）]?\s*$", "")
+            .Trim();
+
+    /// <summary>
+    /// The row's right-hand time column is occasionally OCR'd into the same box as the name
+    /// (a truncated group name almost touches it), which used to produce names like
+    /// "楚萌幼儿园大四..昨天21:39". The conversation id is a hash of this name, so a name that
+    /// changes shape silently detaches every rule bound to it. A trailing question mark is the
+    /// other kind of noise here: OCR has no glyph for an emoji in the name, so "树袋熊🐻" reads
+    /// as "树袋熊?". Both are stripped so the identity is the part a person would type.
+    /// </summary>
+    private static (string Name,string Time) SplitName(string raw)
+    {        var name=raw.Trim();
+        var inline="";
+        var match=TrailingTimeRegex.Match(name);
+        if(match.Success&&match.Groups["name"].Value.Trim().Length>0)
+        {
+            name=match.Groups["name"].Value.Trim();
+            inline=match.Groups["time"].Value.Trim();
+        }
+        // A long name is truncated by WeChat with an ellipsis, which OCR returns as "." / ".." /
+        // "..." on different frames — that alone used to change the conversation id. Collapse
+        // every trailing-dots form to one ellipsis so the identity stops flickering.
+        name=System.Text.RegularExpressions.Regex.Replace(name,@"[.．。·…]+$","…");
+        if(name.Length==0) name=raw.Trim();
+        return (name.TrimEnd('?','？','\ufffd','\u25a1').Trim(),inline);
+    }
+
+    private const string DayOrDate=@"(?:星期[一二三四五六日天]|昨天|前天|\d{1,2}月\d{1,2}日|\d{4}[/\-]\d{1,2}[/\-]\d{1,2})";
+
+    private static readonly System.Text.RegularExpressions.Regex TrailingTimeRegex=new(
+        @"^(?<name>.+?)\s*(?<time>(?:"+DayOrDate+@"\s*)?\d{1,2}:\d{2}|"+DayOrDate+@")$",
+        System.Text.RegularExpressions.RegexOptions.Compiled);
 
     private static bool IsDecoration(string text) =>
         text is "搜索" or "Search" || text.StartsWith("[",StringComparison.Ordinal) || IsTime(text);
 
-    private static bool IsTime(string text) => System.Text.RegularExpressions.Regex.IsMatch(text,
-        @"^(\d{1,2}:\d{2}|星期[一二三四五六日天]|昨天|前天|\d{1,2}月\d{1,2}日|\d{4}[/\-]\d{1,2}[/\-]\d{1,2})$");
+    /// <summary>A pure time cell, including the day+time forms the row may carry.</summary>
+    public static bool IsTimeText(string text) => System.Text.RegularExpressions.Regex.IsMatch(text,
+        @"^(?:"+DayOrDate+@"\s*)?\d{1,2}:\d{2}$|^"+DayOrDate+@"$");
+
+    private static bool IsTime(string text) => IsTimeText(text);
 
     private static bool HasRedBadge(Bitmap bitmap,int upper,int lower,int dpi)
     {

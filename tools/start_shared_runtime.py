@@ -18,6 +18,40 @@ DATA = ROOT / '.runtime-data'
 # host and OCR descendants. Standalone one-shot starts intentionally do not own it.
 SUPERVISOR_JOB = None
 
+# A Host owns port 8766 until it exits, and a child inherits its parent's window
+# station. A supervisor started from a non-interactive window station (early logon,
+# service or agent context) would therefore spawn a Host whose EnumWindows sees no
+# user windows at all: every read fails with provider_unavailable, yet the process
+# keeps the port, so a healthy supervisor only ever sees "another host is already
+# running" and waits forever. Refuse to host until this desktop is usable, and wait
+# for it instead of failing fast so an at-logon start recovers on its own.
+DESKTOP_RETRY_SECONDS = 15
+
+
+class DesktopNotReady(RuntimeError):
+    """This window station cannot see user windows yet; retry later."""
+
+
+def active_console_session():
+    """Session id of the interactive console, or None when nobody is logged on."""
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.WTSGetActiveConsoleSessionId.restype = wintypes.DWORD
+    session = kernel.WTSGetActiveConsoleSessionId()
+    return None if session == 0xFFFFFFFF else session
+
+
+def current_session():
+    """Session id of this process, or None when it cannot be read."""
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.GetCurrentProcessId.restype = wintypes.DWORD
+    kernel.ProcessIdToSessionId.argtypes = [wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+    kernel.ProcessIdToSessionId.restype = wintypes.BOOL
+    session = wintypes.DWORD()
+    if not kernel.ProcessIdToSessionId(kernel.GetCurrentProcessId(), ctypes.byref(session)):
+        return None
+    return session.value
+
+
 class BasicLimitInformation(ctypes.Structure):
     _fields_ = [('PerProcessUserTimeLimit',ctypes.c_longlong),('PerJobUserTimeLimit',ctypes.c_longlong),
                 ('LimitFlags',wintypes.DWORD),('MinimumWorkingSetSize',ctypes.c_size_t),
@@ -63,6 +97,53 @@ def supervise_child(process):
         if handle: kernel.CloseHandle(handle)
 
 
+def _count_visible_user_windows():
+    user32 = ctypes.WinDLL('user32', use_last_error=True)
+    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32.EnumWindows.argtypes = [callback_type, wintypes.LPARAM]
+    user32.EnumWindows.restype = wintypes.BOOL
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+    user32.GetWindowTextLengthW.restype = ctypes.c_int
+
+    seen = []
+
+    def visit(hwnd, _lparam):
+        if user32.IsWindowVisible(hwnd) and user32.GetWindowTextLengthW(hwnd) > 0:
+            seen.append(hwnd)
+        return True
+
+    callback = callback_type(visit)  # keep a reference for the whole call
+    user32.EnumWindows(callback, 0)
+    return len(seen)
+
+
+def desktop_capability():
+    """(ok, detail). Can a Host started by this process enumerate user windows?
+
+    Mirrors what the Windows driver needs: an interactive console session plus a
+    desktop that exposes user windows. See tools/start_shared_runtime.py notes.
+    """
+    if os.name != 'nt':
+        return True, 'not Windows'
+    try:
+        session = current_session()
+        if session is None:
+            return False, 'cannot read the current Windows session id'
+        console = active_console_session()
+        if console is None:
+            return False, 'no interactive console session is active'
+        if console != session:
+            return False, f'session {session} is not the active console session {console}'
+        windows = _count_visible_user_windows()
+        if not windows:
+            return False, 'the current desktop exposes no visible windows yet'
+        return True, f'session {session}, {windows} visible windows'
+    except Exception as error:
+        return False, f'{type(error).__name__}: {error}'
+
+
 def main():
     settings = json.loads((DATA / 'shared-service.json').read_text(encoding='utf-8'))
     endpoint = f"http://127.0.0.1:{settings['port']}/mcp"
@@ -104,6 +185,11 @@ def main():
         try:
             if healthy():
                 return
+            # Only claim the port from a window station that can actually see user
+            # windows; an adopted-but-blind Host is worse than no Host at all.
+            capable, detail = desktop_capability()
+            if not capable:
+                raise DesktopNotReady(detail)
             env = os.environ.copy()
             env['MESSAGING_RUNTIME_TOKEN'] = settings['token']
             command = [settings['dotnet'], str(ROOT / 'artifacts/app/messaging-runtime.dll'),
@@ -129,16 +215,22 @@ def main():
 
 
 if __name__ == '__main__':
-    if sys.argv[1:] not in ([], ['--supervise']):
-        raise SystemExit('Expected no arguments or --supervise.')
+    if sys.argv[1:] not in ([], ['--supervise'], ['--check-desktop']):
+        raise SystemExit('Expected no arguments, --supervise or --check-desktop.')
+    if '--check-desktop' in sys.argv:
+        capable, detail = desktop_capability()
+        print(('interactive desktop ready' if capable else 'not ready to host') + ': ' + detail)
+        raise SystemExit(0 if capable else 1)
     supervise = '--supervise' in sys.argv
     if supervise:
         SUPERVISOR_JOB = create_supervisor_job()
     consecutive_failures = 0
+    desktop_note = None
     while True:
         started_at = time.monotonic()
         try:
             process = main()
+            desktop_note = None
             if not supervise:
                 break
             if process is None:
@@ -150,6 +242,17 @@ if __name__ == '__main__':
             if time.monotonic() - started_at >= 60:
                 consecutive_failures = 0
             raise RuntimeError(f'Host exited with code {code}.')
+        except DesktopNotReady as error:
+            # Transient by definition: a logon-time or otherwise non-interactive
+            # window station usually becomes interactive shortly. Wait it out and
+            # never claim port 8766 in the meantime, so a healthy Host can.
+            if str(error) != desktop_note:
+                desktop_note = str(error)
+                with (DATA / 'shared-service-launcher.log').open('a', encoding='utf-8') as log:
+                    log.write(f'{time.strftime("%Y-%m-%d %H:%M:%S")} DesktopNotReady: {error}. '
+                              f'Waiting {DESKTOP_RETRY_SECONDS}s for an interactive desktop; not hosting.\n')
+            time.sleep(DESKTOP_RETRY_SECONDS)
+            continue
         except Exception as error:
             consecutive_failures += 1
             retry = supervise and consecutive_failures <= 3
