@@ -17,8 +17,17 @@ public sealed record WeChatLayout(int Width, int Height, int Dpi, Rectangle List
         int Px(int value) => (int)Math.Round(value * dpi / 120.0);
         if (frame.Width < Px(650) || frame.Height < Px(480))
             throw new WindowAutomationException("layout_unverified", "WeChat is too small to identify the conversation list.");
-        var split = FindVertical(frame, Math.Max(Px(170),frame.Width/6), Math.Min(frame.Width*3/5,Px(650)),
-            Px(55), frame.Height-Px(40));
+        // The right bound used to be an absolute Px(650), i.e. an assumption that the
+        // conversation column stays under ~570px wide (the nav rail is ~78px). Widening that
+        // column is a normal thing to do — it is how a person gets a full contact name
+        // instead of "周二轮滑1班（16…" — and it pushes the divider past the cap, which made
+        // the ENTIRE list unreadable with a misleading "boundary could not be identified".
+        // Bound the search by leaving the chat pane a workable width instead of by an
+        // absolute list width, so the layout no longer has to match a magic number.
+        var start = Math.Max(Px(170), frame.Width / 6);
+        var end = Math.Min(frame.Width * 3 / 5, frame.Width - Px(280));
+        if (end - start < Px(80)) end = Math.Min(frame.Width - Px(120), start + Px(120));
+        var split = FindVertical(frame, start, end, Px(55), frame.Height-Px(40));
         if (split < 0)
             throw new WindowAutomationException("layout_unverified", "The conversation-list boundary could not be identified.");
 
@@ -54,7 +63,8 @@ public sealed record WeChatLayout(int Width, int Height, int Dpi, Rectangle List
 
     private static int FindVertical(Bitmap frame,int start,int end,int top,int bottom)
     {
-        var best=-1; var score=0.0;
+        var scores=new double[Math.Max(0,end-start)];
+        var best=0.0;
         for (var x=start;x<end;x++)
         {
             int count=0,total=0;
@@ -65,9 +75,16 @@ public sealed record WeChatLayout(int Width, int Height, int Dpi, Rectangle List
                 total++;
             }
             var fraction=total==0?0:count/(double)total;
-            if(fraction>score) {score=fraction;best=x;}
+            scores[x-start]=fraction;
+            if(fraction>best) best=fraction;
         }
-        return score>=0.68?best:-1;
+        if(best<0.68) return -1;
+        // Leftmost near-best, not the single highest score: the conversation divider is the
+        // first full-height boundary after the navigation rail, and now that the search range
+        // is wider (to tolerate a widened list column) a right-pane artefact must not win on a
+        // marginally higher score.
+        for (var x=start;x<end;x++) if(scores[x-start]>=best*0.9) return x;
+        return -1;
     }
 
     private static int FindHorizontal(Bitmap frame,int left,int right,int start,int end,bool composer)

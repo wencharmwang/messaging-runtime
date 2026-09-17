@@ -24,6 +24,7 @@ public static class InputHelper
     private const uint InputKeyboard = 1;
     private const uint InputMouse = 0;
     private const uint KeyeventfKeyup = 0x0002;
+    private const uint KeyeventfUnicode = 0x0004;
 
     // ---- 剪贴板 ----
 
@@ -139,6 +140,29 @@ public static class InputHelper
 
     /// <summary>目标窗口当前是否为前台窗口。</summary>
     public static bool IsForeground(nint hwnd) => GetForegroundWindow() == hwnd;
+
+    /// <summary>
+    /// 系统范围的空闲秒数（距最后一次键鼠输入）。用来区分「用户真的在操作微信」和
+    /// 「只是把微信开着摆在最前面」——后者不该无限期拦住自动读取。
+    /// GetLastInputInfo 是全系统计数，调用方必须先确认目标窗口确实在前台再使用它。
+    /// </summary>
+    public static double IdleSeconds()
+    {
+        var info = new LastInputInfo { cbSize = (uint)Marshal.SizeOf<LastInputInfo>() };
+        if (!GetLastInputInfo(ref info)) return 0;   // 取不到就当作"正在操作"，保持保守
+        var elapsed = unchecked((uint)Environment.TickCount - info.dwTime);
+        return elapsed / 1000.0;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct LastInputInfo
+    {
+        public uint cbSize;
+        public uint dwTime;
+    }
+
+    [DllImport("user32.dll")]
+    private static extern bool GetLastInputInfo(ref LastInputInfo plii);
 
     /// <summary>当前前台窗口句柄，供调用方在临时抢前台后还原。</summary>
     public static nint CurrentForeground() => GetForegroundWindow();
@@ -456,6 +480,30 @@ public static class InputHelper
         RequireForeground(hwnd);
         if (SendInput((uint)inputs.Length,inputs,Marshal.SizeOf<INPUT>()) != inputs.Length)
             throw new WindowAutomationException("input_failed", "Windows rejected part of the keyboard chord.");
+    }
+
+    /// <summary>
+    /// Type literal UTF-16 text through SendInput while the verified target stays foreground.
+    /// This is used by the user-commanded WeChat search box: WM_CHAR posted to the main Qt
+    /// window is not routed to the search editor on recent builds, while foreground Unicode
+    /// keyboard input follows the editor's real focus without borrowing the user's clipboard.
+    /// </summary>
+    public static void SendUnicodeTextGuarded(nint hwnd,string text)
+    {
+        if (text.Any(char.IsControl))
+            throw new WindowAutomationException("input_failed", "Control characters are not valid search text.");
+        foreach (var value in text)
+        {
+            RequireForeground(hwnd);
+            var inputs=new[]
+            {
+                new INPUT { type=InputKeyboard,U=new InputUnion { ki=new KEYBDINPUT { wScan=value,dwFlags=KeyeventfUnicode } } },
+                new INPUT { type=InputKeyboard,U=new InputUnion { ki=new KEYBDINPUT { wScan=value,dwFlags=KeyeventfUnicode|KeyeventfKeyup } } }
+            };
+            if (SendInput(2,inputs,Marshal.SizeOf<INPUT>())!=2)
+                throw new WindowAutomationException("input_failed", "Windows rejected part of the Unicode search text.");
+        }
+        RequireForeground(hwnd);
     }
 
     [DllImport("user32.dll")] private static extern nint WindowFromPoint(POINT point);

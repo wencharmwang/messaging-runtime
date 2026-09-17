@@ -93,7 +93,12 @@ public static class ConversationListLocator
         // A long name is truncated by WeChat with an ellipsis, which OCR returns as "." / ".." /
         // "..." on different frames — that alone used to change the conversation id. Collapse
         // every trailing-dots form to one ellipsis so the identity stops flickering.
-        name=System.Text.RegularExpressions.Regex.Replace(name,@"[.．。·…]+$","…");
+        // Windows OCR sometimes renders an unsupported trailing emoji as one Chinese full stop
+        // (`树袋熊🐻` -> `树袋熊。`). That is OCR noise, not WeChat's truncation marker. If
+        // it is turned into an ellipsis, the user-commanded search literally searches for `树袋熊…`
+        // and cannot find the contact. Preserve actual dot/ellipsis truncation, but drop `。`.
+        name=name.TrimEnd('。');
+        name=System.Text.RegularExpressions.Regex.Replace(name,@"[.．·…]+$","…");
         if(name.Length==0) name=raw.Trim();
         return (name.TrimEnd('?','？','\ufffd','\u25a1').Trim(),inline);
     }
@@ -138,12 +143,16 @@ public static class ConversationListLocator
         var expected=MessageFingerprint.NameKey(name);
         if(expected.Length==0) return null;
         var matches=rows.Where(r=>MessageFingerprint.NameKey(r.Name)==expected).ToArray();
-        if(matches.Length>0) return matches.SingleOrDefault() ?? throw new WeChatDriver.Windows.WindowAutomationException("ambiguous_conversation","Several visible conversation rows have the same name.");
+        // Not `SingleOrDefault`: with two matches it throws InvalidOperationException before the
+        // `??` is ever reached, so the ambiguous_conversation code never made it out — a duplicate
+        // name surfaced as an unmapped error instead of "微信里有多个同名会话，请先改名".
+        if(matches.Length==1) return matches[0];
+        if(matches.Length>1) throw new WeChatDriver.Windows.WindowAutomationException("ambiguous_conversation","Several visible conversation rows have the same name.");
         // Nothing matched exactly: accept a single row that is one character off. Never guess
         // between two candidates — reporting the miss is better than reading the wrong chat.
         var near=rows.Where(r=>ApproximatelySame(r.Name,name)).ToArray();
         if(near.Length>1) throw new WeChatDriver.Windows.WindowAutomationException("ambiguous_conversation","Several visible conversation rows are close to the requested name.");
-        return near.SingleOrDefault();
+        return near.Length==1 ? near[0] : null;
     }
 
     /// <summary>

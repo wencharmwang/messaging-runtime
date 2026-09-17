@@ -194,7 +194,15 @@ public sealed class OcrInputBackend : IWindowAutomationBackend
                 var paddle = new PaddleOcr(script);
                 if (paddle.IsAvailable)
                 {
-                    _ocr = paddle;
+                    // The primary recognizer is a separate Python process: one hiccup and the
+                    // whole read is dead with ocr_failed. Windows OCR is normally still there,
+                    // so a single failover turns "读不到消息" into "读到了，只是置信度低一点",
+                    // and the primary's own failure text is kept for diagnosis instead of lost.
+                    _ocr = new FailoverOcr(paddle, () =>
+                    {
+                        var windows = new WindowsOcr();
+                        return windows.IsAvailable ? windows : null;
+                    });
                     _ownsOcr = true;
                     return;
                 }
@@ -587,7 +595,7 @@ public sealed class OcrInputBackend : IWindowAutomationBackend
             }
         }
         throw new WindowAutomationException("conversation_unverified",
-            "The requested conversation did not open after three fresh visible-row clicks.");
+            $"The requested conversation did not open after three fresh visible-row clicks. 页头实际读到：{DescribeHeader()}");
     }
 
     // 注意：不要再用下面这个方法做「会话是否已打开」的判断——它只看布局是否可用，不看
@@ -668,10 +676,11 @@ public sealed class OcrInputBackend : IWindowAutomationBackend
             InputHelper.SendDelete();
             Thread.Sleep(200);
 
-            // 搜索输入框已获焦，WM_CHAR 会被 Qt 路由进去；坐标仅用于窗口内边界校验。
-            var anchorX = Layout.List.Left + Px(120);
-            var anchorY = Math.Max(Px(20), Layout.List.Top - Px(30));
-            Input.WriteText(anchorX, anchorY, displayName, static () => { });
+            // The search editor is a Qt focus target. Posted WM_CHAR messages to the main
+            // window stopped reaching it on recent WeChat builds, leaving the previous query
+            // visible. The window is already verified foreground here, so send literal Unicode
+            // keyboard input to the real focused editor (without touching the clipboard).
+            InputHelper.SendUnicodeTextGuarded(_hwnd, displayName);
             Thread.Sleep(1400); // 浮层需要时间渲染结果
 
             var popup = WindowDiscovery.FindSearchPopup(_session.ProcessId);
@@ -786,7 +795,12 @@ public sealed class OcrInputBackend : IWindowAutomationBackend
             var text = MessageFingerprint.Normalize(row.Text);
             seen.Add($"{text}/{row.CenterX},{row.CenterY}");
             if (text.Length == 0) continue;
-            var isWanted = string.Equals(text, wanted, StringComparison.OrdinalIgnoreCase);
+            // The OCR engine cannot represent some emoji in a display name and returns a
+            // trailing question mark (`树袋熊🐻` -> `树袋熊?`). Use the exact same conservative
+            // cleanup as visible-list identities; this removes only known trailing OCR noise,
+            // not arbitrary substitutions between two different contacts.
+            var cleaned = MessageFingerprint.Normalize(ConversationListLocator.CleanName(row.Text));
+            var isWanted = string.Equals(cleaned, wanted, StringComparison.OrdinalIgnoreCase);
             // 分区标题自身不能被当成命中，但「标题候选 = 查询词」时必须以命中优先——
             // 微信里有同名会话（例如「文件传输助手」既是功能分区名也可能就是目标会话）。
             if (!isWanted && SearchSections.Contains(text, StringComparer.Ordinal))
@@ -839,7 +853,9 @@ public sealed class OcrInputBackend : IWindowAutomationBackend
             try
             {
                 ObserveLayout();
-                if (ReadHeaderLines().Any(line =>
+                var lines = ReadHeaderLines();
+                RememberHeader(lines);
+                if (lines.Any(line =>
                     {
                         var bare=ConversationListLocator.BareName(line);
                         return MessageFingerprint.NameKey(bare).ToLowerInvariant().Contains(wanted, StringComparison.Ordinal)
@@ -854,6 +870,24 @@ public sealed class OcrInputBackend : IWindowAutomationBackend
         } while (DateTime.UtcNow < deadline);
         return false;
     }
+
+    private string[] _lastHeaderLines = [];
+
+    private void RememberHeader(IReadOnlyList<string> lines)
+    {
+        var text = lines.Where(line => !string.IsNullOrWhiteSpace(line)).ToArray();
+        if (text.Length > 0) _lastHeaderLines = text;
+    }
+
+    /// <summary>
+    /// 页头实际读到了什么，供失败时带出去。
+    ///
+    /// `conversation_unverified` 只说「核不过」，不说读到了什么，于是每次排查都要重新猜是
+    /// OCR 读歪、标题被截断，还是点到了别的行 —— 而这条路径每查一次就要在用户的微信里点三次。
+    /// `conversation_not_visible` 一直带着扫到的行名，这里补齐同样的证据。
+    /// </summary>
+    private string DescribeHeader() =>
+        _lastHeaderLines.Length == 0 ? "(页头没有读到任何文字)" : string.Join(" / ", _lastHeaderLines.Take(6));
 
     /// <summary>Write an automatic reply without OCR/title readback, then submit it.</summary>
     public DirectSendAttempt WriteAndSendDirect(string text)
@@ -1022,7 +1056,7 @@ public sealed class OcrInputBackend : IWindowAutomationBackend
             }
         }
         throw new WindowAutomationException("conversation_unverified",
-            "The requested conversation did not open after three fresh visible-row clicks.");
+            $"The requested conversation did not open after three fresh visible-row clicks. 页头实际读到：{DescribeHeader()}");
     }
 
     public bool VerifyConversationTitle(string displayName) =>
@@ -1032,10 +1066,18 @@ public sealed class OcrInputBackend : IWindowAutomationBackend
     public bool IsForeground => _session is not null && Input.Validate().Foreground;
 
     /// <summary>
-    /// True while the user is looking at or typing in WeChat. Automatic monitoring must not
-    /// move their screen, so a read that would switch the open chat yields instead.
+    /// 只有在「微信在前台 **且** 用户最近还在敲键鼠」时才算用户正在用微信。
+    /// 早先只看前台窗口，于是用户只是把微信开着（人去忙别的、或开着某个会话只是挂着）时，
+    /// 所有会自动切换会话的读取都被无限期拦住，自动回复等于停摆。
+    /// 现在前台但已空闲超过 <see cref="UserBusyIdleSeconds"/> 秒即视为没在操作，读取继续。
     /// </summary>
-    public bool UserIsInWeChat() => _hwnd != nint.Zero && InputHelper.IsForeground(_hwnd);
+    public bool UserIsInWeChat() =>
+        _hwnd != nint.Zero
+        && InputHelper.IsForeground(_hwnd)
+        && InputHelper.IdleSeconds() < UserBusyIdleSeconds;
+
+    /// <summary>微信在前台但空闲超过这个秒数，就认为人不在微信前，自动读取可以继续。</summary>
+    private const double UserBusyIdleSeconds = 10;
 
     /// <summary>
     /// Title of the chat that is open right now, or null when none is. Used to put WeChat back

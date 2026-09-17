@@ -73,8 +73,14 @@ public sealed class WindowBoundInputTests
 
     [Fact] public void FailedActivationCannotSendKeyboardInput()
     {
+        // The guarded activation ladder was refused outright: WeChat never came forward, so no
+        // real input was sent. This used to assert `foreground_lost`, which is the *other*
+        // failure — activation accepted but the window still not foreground. (That one is
+        // pinned by ForegroundLossStopsTheRemainingWheelEvents, which goes through
+        // RequireForeground directly; ActivateForWriting calls the real Win32 ladder and so
+        // cannot be driven by the stub.)
         var native=new Native();var input=new TargetWindowInput(100,42,native);
-        Assert.Equal("foreground_lost",Assert.Throws<WindowAutomationException>(()=>input.ActivateForWriting()).Code);
+        Assert.Equal("foreground_unavailable",Assert.Throws<WindowAutomationException>(()=>input.ActivateForWriting()).Code);
         Assert.Throws<WindowAutomationException>(()=>input.Chord(0x11,0x46));
         Assert.Equal(0,native.Keys);
     }
@@ -164,6 +170,13 @@ public sealed class ConversationListLocatorTests
             new OcrTextRect("短预览",10,10+offset,100,20),
             new OcrTextRect("第二人",10,10+offset*3,100,20)},dpi);
         Assert.Equal(2,rows.Count);
+    }
+
+    [Fact] public void UnsupportedTrailingEmojiDoesNotBecomeASearchEllipsis()
+    {
+        Assert.Equal("树袋熊",ConversationListLocator.CleanName("树袋熊。"));
+        Assert.Equal("树袋熊",ConversationListLocator.CleanName("树袋熊?"));
+        Assert.Equal("很长的会话名…",ConversationListLocator.CleanName("很长的会话名.."));
     }
 }
 

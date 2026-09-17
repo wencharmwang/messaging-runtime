@@ -15,9 +15,10 @@ public static class WindowDiagnostics
     public const int ReferenceWidth = 1118;
     public const int ReferenceHeight = 809;
 
-    // 尺寸偏差容差（与标定窗口相比），超过视为布局可能变化 → Degraded。
-    private const double WidthTolerance = 0.35;
-    private const double HeightTolerance = 0.35;
+    // 可识别下限（参考像素，按 DPI 换算后使用），与 WeChatLayout 的分隔线扫描条件一致。
+    // 这里刻意不再保留「偏离标定的容差」：布局每帧动态检测，尺寸不同不构成问题。
+    private const int MinUsableWidth = 650;
+    private const int MinUsableHeight = 480;
 
     /// <summary>诊断窗口当前状态，返回结构化报告（不修改窗口）。</summary>
     public static WindowHealthReport Diagnose(nint hwnd)
@@ -64,16 +65,24 @@ public static class WindowDiagnostics
             issues.Add($"DPI={dpi}（标定 {ReferenceDpi}），像素锚将按 DPI 缩放");
         }
 
-        // 尺寸偏离标定。
+        // 尺寸：只有「太小」才是真问题——WeChatLayout.Detect 扫不出分隔线会直接抛
+        // layout_unverified（下限见 WeChatLayout：参考宽 650 / 高 480）。
+        // 窗口更大不是缺陷：区域按「顶部固定像素 + 底部固定像素」计算，列表区高度 =
+        // 窗口高 - 上边距 - 下边距，布局每帧按实际位图动态检测分隔线，所以拉高只会
+        // 多读到会话，文字物理尺寸不变、OCR 识别率不受影响。
         if (w > 0 && h > 0)
         {
-            var wDev = Math.Abs(w - ReferenceWidth) / (double)ReferenceWidth;
-            var hDev = Math.Abs(h - ReferenceHeight) / (double)ReferenceHeight;
-            if (wDev > WidthTolerance || hDev > HeightTolerance)
+            var scale = dpi > 0 ? dpi / (double)ReferenceDpi : 1.0;
+            var minWidth = (int)Math.Round(MinUsableWidth * scale);
+            var minHeight = (int)Math.Round(MinUsableHeight * scale);
+            if (w < minWidth || h < minHeight)
             {
                 if (status == "Healthy") status = "Degraded";
-                issues.Add($"窗口尺寸 {w}x{h} 偏离标定 {ReferenceWidth}x{ReferenceHeight}（宽 {wDev:P0} / 高 {hDev:P0}）");
+                issues.Add($"窗口 {w}x{h} 低于会话列表可识别下限 {minWidth}x{minHeight}，布局可能识别不出来");
             }
+            // 尺寸与标定不同**刻意不写进 issues**。issues 的语义是「要处理的问题」，
+            // 写进去会诱导上层（包括 agent）建议用户把窗口改回标定大小，而拉高窗口
+            // 恰恰是正确用法。实际尺寸已经在报文的 width / height 字段里，需要时直接看。
         }
 
         var detail = issues.Count == 0 ? $"窗口 {w}x{h} @ {dpi} DPI" : string.Join("；", issues);
