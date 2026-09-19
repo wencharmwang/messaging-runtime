@@ -50,6 +50,9 @@ public sealed class WeChatProvider(IWeChatDriver driver, string id = "wechat-mai
     /// <summary>见 <see cref="MessagingProvider.RestoreWindow"/>。</summary>
     public override void RestoreWindow() => driver.RestoreWindow();
 
+    /// <summary>见 <see cref="MessagingProvider.ScrollConversationListToTop"/>。</summary>
+    public override void ScrollConversationListToTop() => driver.ScrollConversationListToTop();
+
     public override ContactList SearchContacts(string query)
     {
         var list = ListConversations();
@@ -85,18 +88,18 @@ public sealed class WeChatProvider(IWeChatDriver driver, string id = "wechat-mai
         return new Resolution(match.Title, AllowGlobalSearch: false);
     }
 
-    public override MessageBatch GetMessages(string conversationId, int limit)
+    public override MessageBatch GetMessages(string conversationId, int limit, bool background = false)
     {
         var target = Resolve(conversationId);
-        var lines = driver.ReadMessages(target.Name, limit, target.AllowGlobalSearch);
+        var lines = driver.ReadMessages(target.Name, limit, target.AllowGlobalSearch, background);
         return new(lines.Select(line => WeChatParser.Parse(id, conversationId, line)).ToArray(), false,
             "bounded_ocr_snapshot; synthetic observation IDs; unknown timestamps/senders; OCR may omit or merge messages");
     }
 
-    public override MessageBatch ObserveLatest(string conversationId, int limit)
+    public override MessageBatch ObserveLatest(string conversationId, int limit, bool background = false)
     {
         var target = Resolve(conversationId);
-        var lines = driver.ReadLatestMessages(target.Name, limit, target.AllowGlobalSearch);
+        var lines = driver.ReadLatestMessages(target.Name, limit, target.AllowGlobalSearch, background);
         return new(lines.Select(line => WeChatParser.Parse(id, conversationId, line)).ToArray(), false,
             "latest_visible_ocr_snapshot; no history scroll; top clipped bubble omitted; observation IDs are not native IDs");
     }

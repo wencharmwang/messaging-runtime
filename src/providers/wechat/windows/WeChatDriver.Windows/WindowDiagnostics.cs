@@ -33,7 +33,15 @@ public static class WindowDiagnostics
                 "Unusable", "未找到可见的微信主窗口", new[] { "主窗口不可见或不存在" });
         }
 
-        NativeMethods.GetWindowRect(hwnd, out var r);
+        // A visible handle that cannot produce a rectangle is a dead handle. Ignoring this
+        // return value (as this used to) reported w=0 h=0 on an Unusable window and hid why.
+        if (!NativeMethods.GetWindowRect(hwnd, out var r))
+        {
+            return new WindowHealthReport(
+                processRunning, true, false, false, 0, 0, 0, 0, 0,
+                "Unusable", "无法读取微信窗口边界（句柄已失效）",
+                new[] { "窗口句柄已失效，需要重新绑定微信窗口" });
+        }
         var w = r.Width;
         var h = r.Height;
         var dpi = (int)NativeMethods.GetDpiForWindow(hwnd);

@@ -4,7 +4,8 @@ using MessagingRuntime.Storage;
 namespace MessagingRuntime;
 
 public sealed class MessagingService(ProviderManager providers, MessageStore store, RuntimePolicy policy, string agentId,
-    IApprovalNotifier? approvalNotifier = null, Func<SendRequest, string>? sendAuthorization = null, object? operationGate = null)
+    IApprovalNotifier? approvalNotifier = null, Func<SendRequest, string>? sendAuthorization = null, object? operationGate = null,
+    bool backgroundReads = false)
 {
     private readonly object _gate = operationGate ?? new();
     public IReadOnlyList<ProviderInfo> ListProviders() => Run("list_providers", null, null, providers.List);
@@ -28,6 +29,20 @@ public sealed class MessagingService(ProviderManager providers, MessageStore sto
     {
         providers.Get(provider).RestoreWindow();
         return new { restored = true };
+    });
+
+    /// <summary>
+    /// Explicit, opt-in scroll of the conversation list back to the top. Like
+    /// <see cref="RestoreWindow"/> it is deliberately not part of any read path: WeChat moves a
+    /// conversation that just received a message to the first row without bringing the viewport
+    /// with it, so a list that has been scrolled down hides exactly the rows a poller needs — but
+    /// a scan that scrolled the list on its own would fight the person every polling cycle.
+    /// The caller decides when it is worth it, and how often.
+    /// </summary>
+    public object ScrollConversationListToTop(string provider) => Run("scroll_conversation_list_to_top", provider, null, () =>
+    {
+        providers.Get(provider).ScrollConversationListToTop();
+        return new { scrolled = true };
     });
 
     public UnreadConversations GetUnreadConversations(string provider) => Run("get_unread_conversations", provider, null, () =>
@@ -57,7 +72,7 @@ public sealed class MessagingService(ProviderManager providers, MessageStore sto
         Require(p.Info.Capabilities.ReadMessages, "read_messages");
         store.EnsureProviderRevision(provider,p.SnapshotRevision);
         if (refresh || (before is null && after is null && !store.HasSnapshot(provider, conversationId)))
-            store.SaveSnapshot(provider, conversationId, p.GetMessages(conversationId, 500));
+            store.SaveSnapshot(provider, conversationId, p.GetMessages(conversationId, 500, backgroundReads));
         return store.GetPage(provider, conversationId, limit, before, after);
     });
 
@@ -68,7 +83,7 @@ public sealed class MessagingService(ProviderManager providers, MessageStore sto
         var p = providers.Get(provider);
         Require(p.Info.Capabilities.ReadMessages, "read_messages");
         store.EnsureProviderRevision(provider,p.SnapshotRevision);
-        store.SaveSnapshot(provider, conversationId, p.GetMessages(conversationId, limit));
+        store.SaveSnapshot(provider, conversationId, p.GetMessages(conversationId, limit, backgroundReads));
         return store.GetPage(provider, conversationId, Math.Min(50, limit));
     });
 
@@ -76,7 +91,7 @@ public sealed class MessagingService(ProviderManager providers, MessageStore sto
     {
         ValidatePage(limit, null, null, false);
         Text(conversationId, "conversation_id");
-        return providers.Get(provider).ObserveLatest(conversationId, limit);
+        return providers.Get(provider).ObserveLatest(conversationId, limit, backgroundReads);
     });
 
     public IReadOnlyList<Message> SearchMessages(string provider, string query, string? conversationId = null, int limit = 50)

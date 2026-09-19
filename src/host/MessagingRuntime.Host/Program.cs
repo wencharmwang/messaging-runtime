@@ -116,8 +116,13 @@ public static class Program
                 {
                     workerToken = File.ReadAllText(config.AutoReplyTokenFile!).Trim();
                     var authorization = new AutoReplyAuthorization(config.AutoReplyDatabase);
+                    // backgroundReads: this is the only caller that is a background agent. Its reads
+                    // yield while the person is working in WeChat; every other MCP client on this
+                    // host is answering a person who just asked for something, and must not be
+                    // refused because of their own activity.
                     worker = new MessagingMcpServer(new MessagingService(providers, store, new(SendMode.ReadOnly),
-                        "auto-reply", sendAuthorization: authorization.Evaluate, operationGate: operationGate));
+                        "auto-reply", sendAuthorization: authorization.Evaluate, operationGate: operationGate,
+                        backgroundReads: true));
                 }
                 var app = MessagingTransports.CreateHttp(server, token, port, worker, workerToken);
                 try

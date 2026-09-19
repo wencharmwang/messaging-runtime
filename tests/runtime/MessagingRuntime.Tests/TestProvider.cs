@@ -17,7 +17,7 @@ internal sealed class TestProvider(string id = "test-main", string type = "test"
         new("b", id, ConversationType.Group, "Unknown unread", UnreadCount: null)
     ], false, "test-window");
     public override ContactList SearchContacts(string query) => new([new("a", id, "Alice")], false, "test");
-    public override MessageBatch GetMessages(string conversationId, int limit)
+    public override MessageBatch GetMessages(string conversationId, int limit, bool background = false)
     {
         ReadCalls++;
         if (FailRead) throw new MessagingException("read_failed", "Simulated failure");

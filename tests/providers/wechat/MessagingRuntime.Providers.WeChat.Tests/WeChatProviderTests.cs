@@ -10,15 +10,16 @@ public sealed class WeChatProviderTests
     {
         public IReadOnlyList<WeChatConversation> Conversations { get; set; } = [new("Alice", "pos:0"), new("王经理", "pos:1")];
         public string? LastTarget { get; private set; }
+        public bool? LastBackground { get; private set; }
         public int Calls { get; private set; }
         public int HistoryReads { get; private set; }
         public bool Connect() { Calls++; return true; }
         public IReadOnlyList<WeChatConversation> ListConversations() { Calls++; return Conversations; }
-        public IReadOnlyList<string> ReadMessages(string displayName, int limit)
-        { HistoryReads++; LastTarget = displayName; return ["【对方】你好", "【我】收到", "没有方向", "【对方】[图片]"]; }
-        public IReadOnlyList<string> ReadLatestMessages(string displayName, int limit)
-        { LastTarget = displayName; return new[] {"【对方】相同内容", "【对方】相同内容"}.TakeLast(limit).ToArray(); }
-        public SendReceipt SendText(string displayName, string text)
+        public IReadOnlyList<string> ReadMessages(string displayName, int limit, bool allowGlobalSearch = false, bool background = false)
+        { HistoryReads++; LastTarget = displayName; LastBackground = background; return ["【对方】你好", "【我】收到", "没有方向", "【对方】[图片]"]; }
+        public IReadOnlyList<string> ReadLatestMessages(string displayName, int limit, bool allowGlobalSearch = false, bool background = false)
+        { LastTarget = displayName; LastBackground = background; return new[] {"【对方】相同内容", "【对方】相同内容"}.TakeLast(limit).ToArray(); }
+        public SendReceipt SendText(string displayName, string text, bool allowGlobalSearch = false)
         { LastTarget = displayName; return new("sent", null, "test"); }
         public void Dispose() { }
     }
@@ -34,7 +35,25 @@ public sealed class WeChatProviderTests
         Assert.Equal(2, page.Messages.Count);
         Assert.All(page.Messages, m => Assert.Equal("相同内容", m.Content));
         Assert.False(page.IsComplete);
-        Assert.Throws<MessagingException>(() => provider.ObserveLatest("unknown", 30));
+        // A value that is not a `wechat:` id is a display name the user typed: it is allowed to
+        // target a conversation the visible list does not show, and the driver resolves it through
+        // WeChat's own search. Only an unresolvable `wechat:` id is an error.
+        provider.ObserveLatest("not-in-the-list", 30);
+        Assert.Equal("not-in-the-list", driver.LastTarget);
+        Assert.Throws<MessagingException>(() => provider.ObserveLatest("wechat:deadbeef", 30));
+    }
+
+    [Fact]
+    public void ReadsCarryWhoAskedSoOnlyBackgroundReadsCanYieldToTheUser()
+    {
+        // The driver refuses a read with wechat_in_use only for the background agent. If this flag
+        // stopped reaching it, pressing "organize" would again be refused on the user's own activity.
+        var driver = new Driver();
+        using var provider = new WeChatProvider(driver);
+        provider.ObserveLatest(provider.ConversationId("Alice"), 30);
+        Assert.False(driver.LastBackground);
+        provider.GetMessages(provider.ConversationId("Alice"), 50, background: true);
+        Assert.True(driver.LastBackground);
     }
 
     [Fact]

@@ -17,6 +17,8 @@ public interface IWindowInputNative
     void Click(nint hwnd, int x, int y, bool background);
     void Wheel(nint hwnd, int x, int y, int delta, bool background);
     void Chord(nint hwnd, ushort[] keys);
+    void BackgroundChord(nint hwnd, ushort[] keys) =>
+        throw new WindowAutomationException("background_key_unsupported", "Background shortcut input is unavailable.");
     void Character(nint hwnd, int x, int y, char value) => throw new WindowAutomationException("background_text_unsupported", "Background text input is unavailable.");
     /// <summary>Post a single virtual key (down+up) to the window's own queue. No focus needed.</summary>
     void Key(nint hwnd, ushort virtualKey) => throw new WindowAutomationException("background_key_unsupported", "Background key input is unavailable.");
@@ -48,12 +50,18 @@ public sealed class TargetWindowInput(nint hwnd, int processId, IWindowInputNati
         Validate();
     }
 
-    public void ActivateForWriting()
+    /// <summary>
+    /// Bring WeChat to the foreground for real (SendInput) keyboard work.
+    /// <paramref name="allowAggressiveActivation"/> is passed straight through to
+    /// <see cref="InputHelper.TryActivate"/>: the last rung of that ladder minimizes and restores
+    /// the window, which is visible on screen and therefore reserved for paths a person asked for.
+    /// </summary>
+    public void ActivateForWriting(bool allowAggressiveActivation = false)
     {
         Validate();
         // SetForegroundWindow alone is refused for background processes often enough to
         // matter, so use the guarded ladder instead of the single call.
-        if (!InputHelper.TryActivate(hwnd))
+        if (!InputHelper.TryActivate(hwnd, allowAggressiveActivation))
             throw new WindowAutomationException("foreground_unavailable",
                 "WeChat could not be brought to the foreground, so no real input was sent.");
         RequireForeground();
@@ -98,6 +106,13 @@ public sealed class TargetWindowInput(nint hwnd, int processId, IWindowInputNati
     {
         RequireForeground();
         _native.Chord(hwnd, keys);
+    }
+
+    /// <summary>Post a shortcut only to the bound window's queue; never touches global focus.</summary>
+    public void SendBackgroundChord(params ushort[] keys)
+    {
+        Validate();
+        _native.BackgroundChord(hwnd, keys);
     }
 
     /// <summary>Post one virtual key to the window queue. Works without the foreground.</summary>
@@ -211,6 +226,16 @@ internal sealed class Win32WindowInput(int expectedProcessId) : IWindowInputNati
     }
 
     public void Chord(nint hwnd,ushort[] keys) => InputHelper.SendChordGuarded(hwnd,keys);
+
+    public void BackgroundChord(nint hwnd,ushort[] keys)
+    {
+        // Qt routes top-level key messages to the focused editor inside this exact popup.
+        // Keep modifiers down across the inner keys, then release in reverse order.
+        foreach(var key in keys)
+            Deliver(hwnd,hwnd,0x0100,key,0x00010001); // WM_KEYDOWN
+        foreach(var key in keys.Reverse())
+            Deliver(hwnd,hwnd,0x0101,key,unchecked((nint)0xC0010001UL)); // WM_KEYUP
+    }
 
     public void Character(nint hwnd,int x,int y,char value)
     {

@@ -9,8 +9,17 @@ public abstract class MessagingProvider : IDisposable
     public virtual string SnapshotRevision => "1";
     public virtual ConversationList ListConversations() => throw Unsupported("list_conversations");
     public virtual ContactList SearchContacts(string query) => throw Unsupported("search_contacts");
-    public virtual MessageBatch GetMessages(string conversationId, int limit) => throw Unsupported("read_messages");
-    public virtual MessageBatch ObserveLatest(string conversationId, int limit) => throw Unsupported("observe_latest");
+    /// <summary>
+    /// Read a conversation.
+    /// <paramref name="background"/> says who asked: true only for the background automatic-reply
+    /// agent. A read moves the platform client (opening a chat changes what the person is looking
+    /// at), so a background agent yields while the person is working in that client, while a read
+    /// the person asked for — a button in the UI, or an interactive assistant answering on their
+    /// behalf — must not be refused on their own activity.
+    /// </summary>
+    public virtual MessageBatch GetMessages(string conversationId, int limit, bool background = false) => throw Unsupported("read_messages");
+    /// <inheritdoc cref="GetMessages"/>
+    public virtual MessageBatch ObserveLatest(string conversationId, int limit, bool background = false) => throw Unsupported("observe_latest");
     public virtual SendReceipt SendMessage(string conversationId, string text) => throw Unsupported("send_text");
 
     /// <summary>
@@ -28,6 +37,21 @@ public abstract class MessagingProvider : IDisposable
     /// Message Agent "自动拉回微信窗口" setting) ask for it explicitly.
     /// </summary>
     public virtual void RestoreWindow() => throw Unsupported("restore_window");
+
+    /// <summary>
+    /// Scroll the conversation list back to the top.
+    ///
+    /// WeChat moves a conversation that just received a message to the first row but does not
+    /// bring the viewport with it. A list that has been scrolled down therefore hides exactly the
+    /// rows a poller needs: the conversation reads as "not in the visible list" while sitting right
+    /// there above the viewport — which is why a person who opens that chat once by hand finds the
+    /// assistant working again.
+    ///
+    /// Opt-in for the same reason <see cref="RestoreWindow"/> is: a scan must never move what the
+    /// person is looking at on its own, or it fights them every polling cycle. The caller decides
+    /// when it is worth it, and how often.
+    /// </summary>
+    public virtual void ScrollConversationListToTop() => throw Unsupported("scroll_conversation_list_to_top");
     public virtual SendReceipt ReplyMessage(string conversationId, string messageId, string text) => throw Unsupported("reply");
     public virtual SendReceipt SendFile(string conversationId, string path) => throw Unsupported("send_file");
     protected MessagingException Unsupported(string operation) => new("unsupported_capability", $"Provider '{Info.Id}' does not support {operation}.");

@@ -120,22 +120,37 @@ public sealed class WindowDiscovery
         hwnd != nint.Zero && NativeMethods.IsWindowVisible(hwnd) && !NativeMethods.IsIconic(hwnd);
 
     /// <summary>
-    /// 依次尝试把窗口恢复成可见且非最小化。隐藏到托盘（IsWindowVisible=false）需要用
-    /// SW_SHOWNOACTIVATE/SW_SHOW，最小化到任务栏则需要 SW_RESTORE；每级之后都实际校验。
+    /// 句柄是否仍然存在。窗口被销毁后 <see cref="IsWindowVisible"/> 也会返回 false，
+    /// 两者混在一起时无法区分「窗口被销毁」与「窗口被隐藏」，而前者必须重新发现句柄。
+    /// </summary>
+    public static bool IsWindowAlive(nint hwnd) => hwnd != nint.Zero && NativeMethods.IsWindow(hwnd);
+
+    /// <summary>窗口所属进程 id（句柄归属校验用）。</summary>
+    public static int GetWindowProcessId(nint hwnd)
+    {
+        NativeMethods.GetWindowThreadProcessId(hwnd, out var pid);
+        return (int)pid;
+    }
+
+    /// <summary>
+    /// 把窗口恢复成可见且非最小化，但绝不激活它。
+    ///
+    /// This method is used by the automatic background worker as well as explicit recovery.
+    /// SW_SHOWNORMAL, SW_SHOW and SW_RESTORE may activate the target, so using them here made a
+    /// failed background scan pull WeChat in front of whatever the person was typing in. Windows'
+    /// SW_SHOWNOACTIVATE has the same restore/show semantics without changing the foreground.
     /// </summary>
     public static bool TryRestoreWindow(nint hwnd)
     {
-        foreach (var command in new[]
-                 {
-                     NativeMethods.SwShowNoActivate, NativeMethods.SwShowNormal,
-                     NativeMethods.SwShow, NativeMethods.SwRestore
-                 })
-        {
-            NativeMethods.ShowWindow(hwnd, command);
-            Thread.Sleep(400);
-            if (IsWindowUsable(hwnd)) return true;
-        }
-        return false;
+        var previousForeground = NativeMethods.GetForegroundWindow();
+        NativeMethods.ShowWindow(hwnd, NativeMethods.SwShowNoActivate);
+        Thread.Sleep(400);
+        // Defensive repair for client versions that activate themselves while being shown.
+        // Do not overwrite a newer user choice: restore only while WeChat itself became foreground.
+        if (previousForeground != nint.Zero && previousForeground != hwnd
+            && NativeMethods.GetForegroundWindow() == hwnd)
+            InputHelper.RestoreForeground(previousForeground);
+        return IsWindowUsable(hwnd);
     }
 
     /// <summary>

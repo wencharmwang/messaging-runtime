@@ -18,7 +18,11 @@ public sealed class WindowsWeChatDriver(Func<OcrInputBackend> factory) : IWeChat
     {
         // Refresh on every operation so a recreated Qt main window replaces a
         // stale cached HWND without requiring a Runtime restart.
-        return Run(() => Backend.EstablishSession().Succeeded || Backend.Session is not null);
+        // A failed refresh must not be reported as success. "A session object exists" is not
+        // the same as "that session still points at a live window": returning true here is how
+        // a dead handle used to reach the capture code and surface as capture_failed instead of
+        // the honest window_unavailable. Keep the cached binding only while it is genuinely usable.
+        return Run(() => Backend.EstablishSession().Succeeded || Backend.HasUsableSession());
     }
     public bool BusyWithForegroundSearch => !_disposed && _backend is not null && _backend.ForegroundSearchActive;
     private void Ready(bool writing = false)
@@ -55,27 +59,80 @@ public sealed class WindowsWeChatDriver(Func<OcrInputBackend> factory) : IWeChat
             return true;
         }, skipWhenSearching: true);
     }
-    private void Locate(string name, bool allowGlobalSearch = false)
+
+    /// <summary>
+    /// Scroll the conversation list back to the top. Same shape as <see cref="RestoreWindow"/>:
+    /// an explicit recovery the caller opts into, never part of a read.
+    /// </summary>
+    public void ScrollConversationListToTop()
     {
-        var opened = allowGlobalSearch
-            ? Backend.SelectConversationByGlobalSearch(name)
-            : Backend.SwitchConversation(name);
-        if (!opened)
+        Run(() =>
+        {
+            if (!Backend.ScrollConversationListToTop())
+                throw new MessagingException("conversation_list_unavailable",
+                    "WeChat's conversation list is not available to scroll; the window may be closed or hidden.");
+            return true;
+        }, skipWhenSearching: true);
+    }
+
+    private void Locate(string name, bool allowGlobalSearch = false, bool background = false)
+    {
+        // 用户点名的目标（allowGlobalSearch）：**先试可见列表行点击，找不到再走全局搜索**。
+        //
+        // 以前 allowGlobalSearch 直接等于"走搜索"，于是每一次按名字读取都要把微信切到前台；
+        // 而切不到前台时整条路都失败（实测：前台为 False 时，按名字读全部 contact_not_found，
+        // 连列表里明明看得见的会话也一样）。行点击不抢前台也不慢，行内验证同样有标题校验兜底，
+        // 所以先试它；只有它报"这条不在可见列表里 / 点完核不过"时才动用搜索。
+        if (allowGlobalSearch)
+        {
+            try
+            {
+                if (Backend.SwitchConversation(name)) return;
+            }
+            catch (WindowAutomationException error)
+                when (error.Code is "conversation_not_visible" or "conversation_unverified"
+                      or "window_unavailable" or "layout_unverified")
+            {
+                // 落到下面的全局搜索。
+            }
+            if (Backend.SelectConversationByGlobalSearch(name)) return;
             throw new MessagingException("conversation_unavailable", "The conversation could not be opened for reading.");
+        }
+        try
+        {
+            if (Backend.SwitchConversation(name)) return;
+            throw new MessagingException("conversation_unavailable", "The conversation could not be opened for reading.");
+        }
+        catch (WindowAutomationException error)
+            when (!background && error.Code == "conversation_not_visible")
+        {
+            // 目标只是被滚到列表下面去了。以前这里直接把「看不到这条」还给用户，并让他自己去滚列表
+            // 找 —— 他点的是"帮我读这条"，把活推回去就是没做完。而全局搜索本来就能定位不在可见
+            // 列表里的会话（/api/read 的用户点名路径一直走的就是它）。
+            // 只对用户发起的读取这么做：后台读取不能去抢用户的前台。
+            if (Backend.SelectConversationByGlobalSearch(name)) return;
+            throw;
+        }
     }
 
     /// <summary>
     /// Reading a WeChat conversation means opening it, which moves whatever the user is doing.
-    /// Background monitoring therefore yields while WeChat is in the foreground — unless the
+    /// Background monitoring therefore yields while the user is working in WeChat — unless the
     /// conversation we want is already the open one, in which case nothing moves.
-    /// A user-commanded operation (allowGlobalSearch) never yields: they asked for it.
+    ///
+    /// Only the background automatic-reply agent yields. A read the person asked for — a button
+    /// in the UI, or an interactive assistant answering on their behalf — must never be refused
+    /// because of their own activity: pressing "organize" and being told "you are using WeChat"
+    /// is the assistant blocking the very thing it was asked to do. Measured: the organizer's
+    /// reads were refused five times this way, and the organizer itself had just brought WeChat
+    /// to the foreground, so the busy signal was its own doing.
+    ///
     /// Called after Ready(), so an unusable window is still reported as provider_unavailable
     /// instead of being mistaken for "the user is busy in WeChat".
     /// </summary>
-    private void YieldToUserIfBusy(string displayName, bool allowGlobalSearch, bool alreadyOpen)
+    private void YieldToUserIfBusy(bool alreadyOpen, bool background)
     {
-        if (allowGlobalSearch) return;
-        if (alreadyOpen) return;                  // reading in place moves nothing
+        if (!background || alreadyOpen) return;
         if (!Backend.UserIsInWeChat()) return;
         throw new MessagingException("wechat_in_use", "The user is working in WeChat; this read waits until they stop.");
     }
@@ -84,13 +141,50 @@ public sealed class WindowsWeChatDriver(Func<OcrInputBackend> factory) : IWeChat
     /// open. Put their chat back afterwards: they left WeChat on their own conversation, and
     /// coming back to a different one is a surprise they cannot undo. Only background reads do
     /// this — a user-commanded open is meant to stay where it went.
+    ///
+    /// Only while WeChat is actually in front. When it is not, the person cannot see the chat that
+    /// was swapped out, so swapping it back repairs nothing — it buys one more synthetic row click,
+    /// one more chance for Qt to activate itself and pull WeChat in front of whatever they are
+    /// doing. That invisible round trip is what "它一直在跳" was: every background read moved the
+    /// selection twice, and the second move existed only to undo a change nobody could see.
     /// </summary>
     private void RestoreChatAfterRead(string? displaced, string displayName)
     {
         if (string.IsNullOrWhiteSpace(displaced)) return;
         if (SameChatTitle(displaced, displayName)) return;
-        try { Backend.SwitchConversation(displaced!); }
+        try
+        {
+            if (!Backend.IsForeground) return;
+            Backend.SwitchConversation(displaced!);
+        }
         catch (Exception) { /* best effort: the next read re-establishes whatever it needs */ }
+    }
+
+    /// <summary>
+    /// Background window messages are not supposed to activate WeChat. Keep the caller's
+    /// foreground handle as a transaction invariant anyway: some Qt builds may activate
+    /// themselves while processing a synthetic click. Restore only when WeChat is the window
+    /// that unexpectedly came forward, never over a newer foreground choice made by the user.
+    /// </summary>
+    private void RestoreForegroundAfterBackgroundOperation(nint previousForeground)
+    {
+        try
+        {
+            if (previousForeground == nint.Zero) return;
+            // Qt processes the synthetic row click and only then decides to activate itself, so a
+            // single restore can be undone a moment later. Check twice instead of once: the repair
+            // is cheap, and a missed one leaves WeChat in front of whatever the person is typing in.
+            for (var attempt = 0; attempt < 2; attempt++)
+            {
+                var currentForeground = InputHelper.CurrentForeground();
+                if (previousForeground == currentForeground) return;
+                var session = Backend.Session;
+                if (session is null || WindowDiscovery.GetWindowProcessId(currentForeground) != session.ProcessId) return;
+                InputHelper.RestoreForeground(previousForeground);
+                if (attempt == 0) Thread.Sleep(150);
+            }
+        }
+        catch (Exception) { /* foreground repair must never hide the operation's real outcome */ }
     }
 
     /// <summary>
@@ -123,48 +217,59 @@ public sealed class WindowsWeChatDriver(Func<OcrInputBackend> factory) : IWeChat
         catch (Exception) { return null; }
     }
 
-    public IReadOnlyList<string> ReadMessages(string displayName, int limit, bool allowGlobalSearch = false)
+    public IReadOnlyList<string> ReadMessages(string displayName, int limit, bool allowGlobalSearch = false, bool background = false)
     {
         return Run(() =>
         {
+            var previousForeground = background ? InputHelper.CurrentForeground() : nint.Zero;
             if (allowGlobalSearch) Backend.RestoreWindowSession();
             Ready();
             var displaced = DisplacedChat(allowGlobalSearch);
             var alreadyOpen = HeaderIsExactly(displaced, displayName);
-            YieldToUserIfBusy(displayName, allowGlobalSearch, alreadyOpen);
+            YieldToUserIfBusy(alreadyOpen, background);
             try
             {
                 // Already the open chat: no row click, so nothing moves at all.
-                if (!alreadyOpen) Locate(displayName, allowGlobalSearch);
+                if (!alreadyOpen) Locate(displayName, allowGlobalSearch, background);
                 return Backend.ReadChatHistory(out _, limit);
             }
-            finally { RestoreChatAfterRead(displaced, displayName); }
+            finally
+            {
+                RestoreChatAfterRead(displaced, displayName);
+                RestoreForegroundAfterBackgroundOperation(previousForeground);
+            }
         });
     }
-    public IReadOnlyList<string> ReadLatestMessages(string displayName, int limit, bool allowGlobalSearch = false) => Run(() =>
+    public IReadOnlyList<string> ReadLatestMessages(string displayName, int limit, bool allowGlobalSearch = false, bool background = false) => Run(() =>
     {
+        var previousForeground = background ? InputHelper.CurrentForeground() : nint.Zero;
         if (allowGlobalSearch) Backend.RestoreWindowSession();
         Ready();
         var displaced = DisplacedChat(allowGlobalSearch);
         var alreadyOpen = HeaderIsExactly(displaced, displayName);
-        YieldToUserIfBusy(displayName, allowGlobalSearch, alreadyOpen);
+        YieldToUserIfBusy(alreadyOpen, background);
         try
         {
             // Already the open chat: no row click, so nothing moves at all.
-            if (!alreadyOpen) Locate(displayName, allowGlobalSearch);
+            if (!alreadyOpen) Locate(displayName, allowGlobalSearch, background);
             return Backend.ReadLatestMessages(limit);
         }
-        finally { RestoreChatAfterRead(displaced, displayName); }
+        finally
+        {
+            RestoreChatAfterRead(displaced, displayName);
+            RestoreForegroundAfterBackgroundOperation(previousForeground);
+        }
     });
     public SendReceipt SendText(string displayName, string text, bool allowGlobalSearch = false)
     {
         return Run<SendReceipt>(() =>
         {
+            var previousForeground = Backend.BackgroundWriting ? InputHelper.CurrentForeground() : nint.Zero;
             var submissionStarted = false;
-            // Sending must bring WeChat forward and open the chat (there is no other way to type
-            // into it), so remember what the user had open and put it back once the message is
-            // confirmed. Left on the uncertain path on purpose: seeing that chat is how the user
-            // checks what actually happened.
+            // Sending opens the target chat. Background mode keeps the OS foreground unchanged;
+            // the explicit foreground fallback may bring WeChat forward. Remember the displaced
+            // chat and put it back once the message is confirmed. Leave it on the uncertain path:
+            // seeing that chat is how the user checks what actually happened.
             var displaced = allowGlobalSearch ? null : DisplacedChat(false);
             try
             {
@@ -204,6 +309,7 @@ public sealed class WindowsWeChatDriver(Func<OcrInputBackend> factory) : IWeChat
                     _ => "preflight_failed"
                 });
             }
+            finally { RestoreForegroundAfterBackgroundOperation(previousForeground); }
         });
     }
 

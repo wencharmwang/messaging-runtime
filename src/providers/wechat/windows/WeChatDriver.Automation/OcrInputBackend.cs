@@ -67,7 +67,7 @@ public sealed class OcrInputBackend : IWindowAutomationBackend
                 Input.ExpectGeometry(frame.Width,frame.Height,_dpi);
                 return;
             }
-            catch (WindowAutomationException ex) when (ex.Code is "layout_unverified" or "window_changed" or "window_unavailable")
+            catch (WindowAutomationException ex) when (IsRecoverable(ex))
             {
                 last = ex;
                 _layout = null;
@@ -280,6 +280,28 @@ public sealed class OcrInputBackend : IWindowAutomationBackend
         return result;
     }
 
+    /// <summary>
+    /// 「窗口状态在操作途中变了」的失败码 —— 重新观察一轮就可能成功。
+    /// <c>capture_failed</c> 属于这一类：它来自一次没读到窗口边界的截图，最常见的原因正是
+    /// Qt 在重建窗口。把它排除在自愈之外，读路径就永远不会重试，产品文案里的
+    /// 「助手会自动重试」也就成了空话。
+    /// 与之相对，invalid_target / window_occluded / foreground_lost / OCR 不可用是**结论**，
+    /// 重试只会把真实错误拖长。
+    /// </summary>
+    private static bool IsRecoverable(WindowAutomationException error) =>
+        error.Code is "layout_unverified" or "layout_changed" or "window_changed"
+            or "window_unavailable" or "capture_failed";
+
+    /// <summary>
+    /// 当前绑定是否仍指向同一个微信进程的、可见且未最小化的窗口。
+    /// 重新发现失败时用它判断缓存句柄还能不能用：句柄已死就必须让调用方看到
+    /// window_unavailable，而不是拿着死窗口一路走到截图失败。
+    /// </summary>
+    public bool HasUsableSession() =>
+        _session is not null
+        && WindowDiscovery.IsWindowUsable(_hwnd)
+        && WindowDiscovery.GetWindowProcessId(_hwnd) == _session.ProcessId;
+
     /// <summary>诊断并自愈微信窗口（最小化/屏幕外自动还原+置前）。返回诊断报告。</summary>
     public WindowHealthReport DiagnoseWindow()
     {
@@ -327,7 +349,7 @@ public sealed class OcrInputBackend : IWindowAutomationBackend
             // Opening a conversation clears its red unread badge. The badge is
             // UI state, not a new message; including it caused one incoming
             // message to trigger a second open after the first read.
-            MessageFingerprint.ActivityHash($"{r.Preview}\n{r.DisplayTime}"),DateTimeOffset.Now,true,false)).ToArray();
+            MessageFingerprint.ActivityHash($"{r.Preview}\n{MessageFingerprint.ActivityTimeKey(r.DisplayTime)}"),DateTimeOffset.Now,true,false)).ToArray();
         return OperationResult<IReadOnlyList<ConversationState>>.Ok(result);
     }
 
@@ -568,7 +590,7 @@ public sealed class OcrInputBackend : IWindowAutomationBackend
                 ObserveLayout();
                 if (WaitForConversationTitle(displayName, 1200)) return true;
             }
-            catch (WindowAutomationException ex) when (ex.Code is "layout_unverified" or "layout_changed" or "window_changed" or "window_unavailable")
+            catch (WindowAutomationException ex) when (IsRecoverable(ex))
             {
                 // Fall through to a fresh visible-row selection.
             }
@@ -582,13 +604,44 @@ public sealed class OcrInputBackend : IWindowAutomationBackend
         {
             ObserveListLayout();
             var rows = ReadConversationRows();
-            var row = ConversationListLocator.Unique(rows, displayName)
-                ?? throw new WindowAutomationException("conversation_not_visible",
-                    $"The requested conversation is not in the visible list. Scroll the conversation list manually and retry. Visible rows: {ConversationListLocator.Describe(rows)}");
+            // 同 SwitchConversation：名字读歪时用已确认过的头像指纹把行找回来。
+            // 没有这一步，发送会在「识别不了人」处直接失败——那正是用户报的问题。
+            var (row, identifiedByAvatar) = LocateVisibleRow(rows, displayName);
+            if (row is null && clickAttempt == 0)
+            {
+                // 收消息的会话会被挪到列表第一位，但视口可能还停在下面；回顶再找一次。
+                ScrollListToTop();
+                ObserveListLayout();
+                rows = ReadConversationRows();
+                (row, identifiedByAvatar) = LocateVisibleRow(rows, displayName);
+            }
+            if (row is null)
+                throw new WindowAutomationException("conversation_not_visible",
+                    $"The requested conversation is not in the visible list, and no visible row matched its known avatar — the list was also scrolled back to the top and re-scanned. Visible rows: {ConversationListLocator.Describe(rows)}");
             Input.Click(Layout.List.Left + row.X, Layout.List.Top + row.Y);
             // 必须核对标题：列表可能在取坐标与点击之间重排，点错行就会把消息发错人。
             if (WaitForConversationTitle(displayName, 3000))
             {
+                RememberAvatar(displayName, row.Avatar);
+                _verifiedConversation = displayName;
+                _verifiedConversationAtUtc = DateTime.UtcNow;
+                return true;
+            }
+            // 页头读歪不等于点错了行。头像唯一命中是图像证据，强度不低于文字匹配，
+            // 复查过列表没有重排就可以认。发错人的方向依然被 UniqueByAvatar 的
+            //「唯一命中」和这里的坐标复查双重挡住。
+            if (identifiedByAvatar && AvatarStillUnique(displayName, row))
+            {
+                RememberAvatar(displayName, row.Avatar);
+                _verifiedConversation = displayName;
+                _verifiedConversationAtUtc = DateTime.UtcNow;
+                return true;
+            }
+            // 同 SwitchConversation：页头读不出不等于点错了行。坐标对得上 + 重扫名字仍唯一
+            // 已经排除了点错行与列表重排，继续点第二次只会让同一个会话在用户眼前反复打开。
+            if (RowStillUniqueAtSamePlace(displayName, row))
+            {
+                RememberAvatar(displayName, row.Avatar);
                 _verifiedConversation = displayName;
                 _verifiedConversationAtUtc = DateTime.UtcNow;
                 return true;
@@ -613,7 +666,7 @@ public sealed class OcrInputBackend : IWindowAutomationBackend
                 ObserveLayout();
                 if (expectedTitle is null || VerifyConversationTitle(expectedTitle)) return true;
             }
-            catch (WindowAutomationException ex) when (ex.Code is "layout_unverified" or "layout_changed" or "window_changed" or "window_unavailable")
+            catch (WindowAutomationException ex) when (IsRecoverable(ex))
             {
                 // Qt can drop or defer a background row click while repainting.
                 // The caller refreshes OCR coordinates and clicks the row again.
@@ -666,36 +719,56 @@ public sealed class OcrInputBackend : IWindowAutomationBackend
         {
             // 搜索框不响应投递消息、快捷键又必须先获得焦点，所以这里必须真实前台化 +
             // 真实点击（实测：真实点击既能给窗口焦点又能打开搜索，最稳）。
-            Input.ActivateForWriting();
+            // 这一步是用户主动点名的操作，屏幕上本来就会看到微信被拉起，因此允许最后一级
+            // 兜底（最小化再还原）——它的目的就是把成功率做到最高。
+            try { Input.ActivateForWriting(allowAggressiveActivation: true); }
+            catch (WindowAutomationException error) when (error.Code is "foreground_lost" or "foreground_unavailable")
+            {
+                throw new WindowAutomationException(error.Code,$"activate_main: {error.Message}");
+            }
             ObserveListLayout();   // 只读路径不会预先建立布局，这里需要 List 区坐标
             ClickSearchBox();
-            Thread.Sleep(700);
-            // 微信会保留上一次的搜索词，必须先清空；否则新词会插进旧词中间，
-            // 结果与预期完全不符（实测：键入 "Bros" 后残留成 "Br…os"）。
-            InputHelper.SendCtrlA();
-            InputHelper.SendDelete();
-            Thread.Sleep(200);
-
-            // The search editor is a Qt focus target. Posted WM_CHAR messages to the main
-            // window stopped reaching it on recent WeChat builds, leaving the previous query
-            // visible. The window is already verified foreground here, so send literal Unicode
-            // keyboard input to the real focused editor (without touching the clipboard).
-            InputHelper.SendUnicodeTextGuarded(_hwnd, displayName);
-            Thread.Sleep(1400); // 浮层需要时间渲染结果
-
-            var popup = WindowDiscovery.FindSearchPopup(_session.ProcessId);
-            if (popup == nint.Zero)
+            // Creating the separate Qt popup is asynchronous and occasionally takes more than
+            // 700ms. Do not send Ctrl+F during that transition: WeChat has already moved focus
+            // to a temporary same-process window, so an exact-main-HWND shortcut guard would
+            // correctly reject it as foreground_lost. Waiting is both quieter and deterministic.
+            var popup = WaitForSearchPopup(_session.ProcessId,1500);
+            if(popup==nint.Zero)
             {
-                // 兜底：个别状态点击不会打开搜索页，再试一次真实 Ctrl+F。
-                InputHelper.SendCtrlF();
-                Thread.Sleep(1000);
-                popup = WindowDiscovery.FindSearchPopup(_session.ProcessId);
+                // A real click is occasionally accepted without opening the editor. WeChat only
+                // accepts a real Ctrl+F here, but its foreground HWND may already be a temporary
+                // Qt window. Send only while foreground still belongs to the WeChat process.
+                InputHelper.SendChordForProcessGuarded(_hwnd,0x11,0x46);
+                popup=WaitForSearchPopup(_session.ProcessId,3000);
             }
             if (popup == nint.Zero)
                 throw new WindowAutomationException("search_unavailable",
                     "微信搜索浮层没有出现，无法搜索该联系人。");
 
-            var match = FindUniqueSearchResult(popup, displayName, out var trace);
+            // The click above already opened this popup and put the caret in its editor, so it is
+            // deliberately NOT activated here. This window is a Qt popup, and Qt dismisses a popup
+            // that loses activation: measured, it disappeared within ~200ms of
+            // SetForegroundWindow being called on it, which left the query untyped and the search
+            // reporting "no results" — while the handle churn looked like a mid-flight rebuild.
+            // The real input below is still process-guarded, so another application taking focus
+            // stops it before a single key is sent.
+            // 微信会保留上一次的搜索词，必须先清空；否则新词会插进旧词中间，
+            // 结果与预期完全不符（实测：键入 "Bros" 后残留成 "Br…os"）。
+            InputHelper.SendChordForProcessGuarded(_hwnd,0x11,0x41); // Ctrl+A
+            InputHelper.SendChordForProcessGuarded(_hwnd,0x2E);      // Delete
+            Thread.Sleep(200);
+
+            InputHelper.SendUnicodeTextGuarded(_hwnd,displayName);
+            Thread.Sleep(1400); // 浮层需要时间渲染结果
+
+            // WeChat destroys and recreates the QWindowToolSaveBits popup when the query
+            // changes. Never capture or click through the pre-input handle.
+            popup=WaitForSearchPopup(_session.ProcessId,2000);
+            if(popup==nint.Zero)
+                throw new WindowAutomationException("search_unavailable",
+                    "微信搜索结果浮层没有出现，无法核对联系人。");
+
+            var match = FindUniqueSearchResult(_session.ProcessId, ref popup, displayName, out var trace);
             if (match is null)
                 throw new WindowAutomationException("contact_not_found",
                     $"微信搜索结果里没有与「{displayName}」同名的联系人，请核对名称是否准确。[{trace}]");
@@ -727,6 +800,18 @@ public sealed class OcrInputBackend : IWindowAutomationBackend
             InputHelper.MoveCursor(previousCursor.X, previousCursor.Y);
             InputHelper.RestoreForeground(previousForeground);
         }
+    }
+
+    private static nint WaitForSearchPopup(int processId,int maxWaitMs)
+    {
+        var deadline=DateTime.UtcNow.AddMilliseconds(maxWaitMs);
+        do
+        {
+            var popup=WindowDiscovery.FindSearchPopup(processId);
+            if(popup!=nint.Zero) return popup;
+            Thread.Sleep(100);
+        } while(DateTime.UtcNow<deadline);
+        return nint.Zero;
     }
 
     /// <summary>
@@ -784,13 +869,23 @@ public sealed class OcrInputBackend : IWindowAutomationBackend
     };
 
     /// <summary>在搜索浮层里找同名结果行；命中多个分区视为歧义。</summary>
-    private (int X, int Y)? FindUniqueSearchResult(nint popup, string displayName, out string trace)
+    /// <remarks>
+    /// <paramref name="popup"/> 是 <c>ref</c>：读取结果行时浮层可能已被微信重建，
+    /// 返回的坐标属于新浮层，调用方必须用回写后的句柄去点击。
+    /// </remarks>
+    private (int X, int Y)? FindUniqueSearchResult(int processId, ref nint popup, string displayName, out string trace)
     {
         var wanted = MessageFingerprint.Normalize(displayName);
+        // The query is whatever name the caller read off the list, so it can carry the same OCR
+        // noise the result rows are cleaned of. Comparing the raw query against a cleaned row
+        // reported a contact as missing that WeChat had just found (树袋熊… vs 树袋熊).
+        // CleanName is the same cleanup the row identity uses, so this cannot conflate two
+        // different contacts: it only makes the query as clean as the row it is compared to.
+        var wantedClean = MessageFingerprint.Normalize(ConversationListLocator.CleanName(displayName));
         var section = "";
         var hits = new List<(int X, int Y, string Section)>();
         var seen = new List<string>();
-        foreach (var row in ReadSearchPanelRows(popup))
+        foreach (var row in ReadSearchPanelRows(processId, ref popup))
         {
             var text = MessageFingerprint.Normalize(row.Text);
             seen.Add($"{text}/{row.CenterX},{row.CenterY}");
@@ -800,7 +895,8 @@ public sealed class OcrInputBackend : IWindowAutomationBackend
             // cleanup as visible-list identities; this removes only known trailing OCR noise,
             // not arbitrary substitutions between two different contacts.
             var cleaned = MessageFingerprint.Normalize(ConversationListLocator.CleanName(row.Text));
-            var isWanted = string.Equals(cleaned, wanted, StringComparison.OrdinalIgnoreCase);
+            var isWanted = string.Equals(cleaned, wanted, StringComparison.OrdinalIgnoreCase)
+                || (wantedClean.Length > 0 && string.Equals(cleaned, wantedClean, StringComparison.OrdinalIgnoreCase));
             // 分区标题自身不能被当成命中，但「标题候选 = 查询词」时必须以命中优先——
             // 微信里有同名会话（例如「文件传输助手」既是功能分区名也可能就是目标会话）。
             if (!isWanted && SearchSections.Contains(text, StringComparer.Ordinal))
@@ -815,27 +911,67 @@ public sealed class OcrInputBackend : IWindowAutomationBackend
         if (hits.Count == 0) return null;
         // 命中行必须挂在已知分区标题下：首屏不带标题的那一条往往是「聊天记录/文章」入口，
         // 文字恰好等于查询词，点它不会打开会话（实测「文件传输助手」首行就是这样，
-        // 真正能打开会话的那一条在「功能」分区里）。没有分区的命中一律不采信。
+        // 真正能打开会话的那一条在「功能」分区里）。
         var sectioned = hits.Where(h => h.Section.Length > 0).ToList();
-        if (sectioned.Count == 0) return null;
-        // 分区有优先级：会话类 > 功能类 > 账号类 > 内容类（文章/聊天记录…）。
-        // 同一优先级跨多个分区才算歧义；低优先级分区彻底忽略。
+        if (sectioned.Count == 0)
+        {
+            // 但这条规则也有反例，而且实测不止一次：浮层顶部那一行在第一个分区标题之前，有些会话
+            // 的同名结果**只有**那一条（实测「轮滑班群」「王丛喜一果爸爸星期」的搜索结果里就一条），
+            // 于是永远找不到联系人 —— 而且看起来像"微信里没有这个人"。
+            // 采信它需要一个安全网，而这个安全网本来就在：点完之后必须核对聊天页头
+            // （WaitForConversationTitle），点错行会判 conversation_unverified 而不会读错内容。
+            // 所以这里只放宽"唯一一条同名命中"这一种情况，多了仍然不猜。
+            if (hits.Count != 1) return null;
+            var only = hits[0];
+            trace += $"; picked=(no-section)@{only.X},{only.Y}";
+            return (only.X, only.Y);
+        }
+        // 分区有优先级：会话类 > 功能类 > 账号类 > 内容类（文章/聊天记录…）。低优先级分区彻底忽略。
+        // 同一优先级跨多个分区**不再**直接判歧义：浮层会把同一个联系人重复列出（实测「树袋熊」
+        // 同时出现在「最常使用」和「查看全部」的完整结果里），这是微信的重复展示而不是两个不同的
+        // 人。命中行的清洗后名字本来就等于查询词，所以「跨分区」从来无法区分出不同会话；真正决定
+        // 打开的是哪一个会话，靠的是打开之后的标题校验（WaitForConversationTitle）。
         var best = sectioned.Min(h => SectionRank(h.Section));
         var candidates = sectioned.Where(h => SectionRank(h.Section) == best).ToList();
-        if (candidates.Select(h => h.Section).Distinct(StringComparer.Ordinal).Count() > 1)
-            throw new WindowAutomationException("ambiguous_contact",
-                $"「{displayName}」在多个分类下都出现，无法确定是哪一个，请在微信里核对。[{trace}]");
         var first = candidates.OrderBy(h => h.Y).First();
         trace += $"; picked={first.Section}@{first.X},{first.Y}";
         return (first.X, first.Y);
     }
 
-    private IReadOnlyList<OcrTextRect> ReadSearchPanelRows(nint popup)
+    /// <summary>
+    /// 读搜索浮层的文字行。
+    /// 浮层句柄必须在**每次捕获前**重新发现：微信会在查询变化时销毁并重建
+    /// QWindowToolSaveBits（见 <see cref="SelectConversationByGlobalSearch"/> 的说明，
+    /// 那里刻意写明「绝不在输入前的句柄上截图或点击」）。在旧句柄上截图会拿到一个已死的
+    /// 窗口，GetWindowRect 直接失败 —— 这就是线上读会话时看到的 capture_failed。
+    /// 新句柄通过 <paramref name="popup"/> 回写，调用方随后的点击必须落在同一个浮层上。
+    /// </summary>
+    private IReadOnlyList<OcrTextRect> ReadSearchPanelRows(int processId, ref nint popup)
     {
-        using var bitmap = WindowCapture.CaptureWindow(popup);
-        return _ocr.RecognizePngWithRects(WindowCapture.ToPng(bitmap))
-            .Where(r => !IsSearchTerminalEntry(MessageFingerprint.Normalize(r.Text)))
-            .ToArray();
+        WindowAutomationException? last = null;
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            var fresh = WindowDiscovery.FindSearchPopup(processId);
+            if (fresh == nint.Zero)
+                throw new WindowAutomationException("search_unavailable",
+                    "微信搜索结果浮层已经消失，无法读取结果行。");
+            popup = fresh;
+            try
+            {
+                using var bitmap = WindowCapture.CaptureWindow(popup);
+                return _ocr.RecognizePngWithRects(WindowCapture.ToPng(bitmap))
+                    .Where(r => !IsSearchTerminalEntry(MessageFingerprint.Normalize(r.Text)))
+                    .ToArray();
+            }
+            catch (WindowAutomationException error) when (error.Code is "window_changed" or "capture_failed")
+            {
+                // 微信正在重建浮层：等一拍再重新发现一次，不要在死句柄上重试。
+                last = error;
+                Thread.Sleep(150);
+            }
+        }
+        throw last ?? new WindowAutomationException("window_changed",
+            "微信搜索结果浮层反复重建，无法读取结果行。");
     }
 
     /// <summary>
@@ -855,15 +991,11 @@ public sealed class OcrInputBackend : IWindowAutomationBackend
                 ObserveLayout();
                 var lines = ReadHeaderLines();
                 RememberHeader(lines);
-                if (lines.Any(line =>
-                    {
-                        var bare=ConversationListLocator.BareName(line);
-                        return MessageFingerprint.NameKey(bare).ToLowerInvariant().Contains(wanted, StringComparison.Ordinal)
-                            || ConversationListLocator.ApproximatelySame(bare,displayName);
-                    }))
+                if (lines.Any(line => ConversationListLocator.HeaderMatches(
+                        ConversationListLocator.BareName(line), displayName)))
                     return true;
             }
-            catch (WindowAutomationException ex) when (ex.Code is "layout_unverified" or "layout_changed" or "window_changed" or "window_unavailable")
+            catch (WindowAutomationException ex) when (IsRecoverable(ex))
             {
                 // Qt 正在重建会话视图，下一轮再读。
             }
@@ -871,7 +1003,153 @@ public sealed class OcrInputBackend : IWindowAutomationBackend
         return false;
     }
 
+    /// <summary>
+    /// Read-only recovery for a badly OCR'd row label. A fuzzy header comparison is accepted only
+    /// when a fresh list scan maps that header to exactly one row and that row is also the unique
+    /// target selected by <see cref="ConversationListLocator.Unique"/>. This keeps the protection
+    /// against list reordering: if the click landed on a neighbour, that neighbour becomes the
+    /// header candidate and the intended row does not, so the read is rejected.
+    /// </summary>
+    private bool NoisyHeaderIdentifiesUniqueVisibleTarget(string displayName)
+    {
+        if(_lastHeaderLines.Length==0) return false;
+        try
+        {
+            ObserveListLayout();
+            var rows=ReadConversationRows();
+            var intended=ConversationListLocator.Unique(rows,displayName);
+            if(intended is null) return false;
+            var candidates=rows.Where(row=>_lastHeaderLines.Any(line=>
+                    ConversationListLocator.NoisyRowCouldMatchHeader(line,row.Name)))
+                .ToArray();
+            return candidates.Length==1
+                && candidates[0].X==intended.X
+                && candidates[0].Y==intended.Y;
+        }
+        catch(WindowAutomationException error) when(IsRecoverable(error))
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// When the background window capture cannot OCR any header at all, prove the selected chat
+    /// by its latest-message preview instead. We provisionally enable a single non-scrolling OCR
+    /// read, then require those bubbles to identify exactly one freshly scanned visible row and
+    /// require that row to be the intended target. Nothing is returned if the proof is ambiguous.
+    /// </summary>
+    private bool PreviewIdentifiesUniqueVisibleTarget(string displayName)
+    {
+        _lastPreviewProof="started";
+        try
+        {
+            _verifiedConversation=displayName;
+            _verifiedConversationAtUtc=DateTime.UtcNow;
+            // The fresh visible-row scan already established the pane geometry. Re-running the
+            // stricter full-layout detector here fails on an occluded background window before
+            // the preview proof can run, even though the existing message rectangle is usable.
+            var messages=MessageCleaner.FilterUiNoise(ReadScreenMessages(verifyTarget:false).Messages).TakeLast(5).ToArray();
+            ObserveListLayout();
+            var rows=ReadConversationRows();
+            var intended=ConversationListLocator.Unique(rows,displayName);
+            if(intended is null)
+            {
+                _lastPreviewProof=$"messages={messages.Length}; rows={rows.Count}; intended=0";
+                return false;
+            }
+            var candidates=rows.Where(row=>messages.Any(message=>
+                    ConversationListLocator.PreviewCouldMatchMessage(row.Preview,message)))
+                .ToArray();
+            _lastPreviewProof=$"messages={messages.Length}; rows={rows.Count}; candidates={candidates.Length}; targetPreviewKey={MessageFingerprint.NameKey(intended.Preview).Length}";
+            if(candidates.Length==1&&candidates[0].X==intended.X&&candidates[0].Y==intended.Y)
+                return true;
+        }
+        catch(WindowAutomationException error) when(IsRecoverable(error))
+        {
+            _lastPreviewProof="error="+error.Code;
+            // The caller retries from a fresh row scan.
+        }
+        _verifiedConversation=null;
+        _verifiedConversationAtUtc=DateTime.MinValue;
+        return false;
+    }
+
+    private string _lastPreviewProof="not_attempted";
+
     private string[] _lastHeaderLines = [];
+
+    /// <summary>
+    /// 上一次成功打开某会话时记下的头像指纹，key 是名字的 NameKey。
+    ///
+    /// 会话身份原本只有「名字的哈希」一把钥匙，而名字是 OCR 读出来的、会抖：小璐璐 会被读成
+    /// 小 璐 璐 / 小璐路璐 / 小璐路璐路ONR，哈希每次都变，于是点对了行也判 conversation_unverified。
+    /// 这里存下**已经确认打开过**的那个会话的头像指纹，下次名字读歪时用它把行找回来。
+    /// 只在成功打开时写入，所以缓存里的绑定一定是真的。
+    /// </summary>
+    private readonly Dictionary<string,string> _avatarByConversation=new(StringComparer.Ordinal);
+
+    private string? KnownAvatar(string displayName)
+    {
+        var key=MessageFingerprint.NameKey(displayName);
+        return key.Length>0&&_avatarByConversation.TryGetValue(key,out var avatar)?avatar:null;
+    }
+
+    private void RememberAvatar(string displayName,string? avatar)
+    {
+        var key=MessageFingerprint.NameKey(displayName);
+        if(key.Length==0||string.IsNullOrEmpty(avatar)) return;
+        _avatarByConversation[key]=avatar;
+    }
+
+    /// <summary>
+    /// 点击之后复查一次：目标头像在**刚重新扫到**的列表里仍然唯一命中，并且还是刚才点的那一行。
+    /// 头像唯一命中已经足以证明这一行是谁，但要排除「扫描与点击之间列表重排」这一种情况 ——
+    /// 那正是当初加页头校验要防的事。
+    /// </summary>
+    private bool AvatarStillUnique(string displayName,ConversationRow clicked)
+    {
+        try
+        {
+            ObserveListLayout();
+            var match=ConversationListLocator.UniqueByAvatar(ReadConversationRows(),KnownAvatar(displayName));
+            return match is not null&&match.X==clicked.X&&match.Y==clicked.Y;
+        }
+        catch(WindowAutomationException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 点击之后复查一次：目标行还在**同一个坐标**上，而且这个名字在刚扫到的列表里仍然唯一。
+    ///
+    /// 后台页头 OCR 读不出标题只说明「读不出」，不说明点错了行。这句话原本只有头像一条旁证
+    /// （<see cref="AvatarStillUnique"/>），而头像只在**上次成功打开过**之后才有记录 ——
+    /// 一条规则的第一次读取没有头像可用，于是点对了行也判 conversation_unverified，再点第二次、
+    /// 第三次，用户在微信里看到的就是「一直在选中同一个会话」。
+    ///
+    /// 这里补的是第二把旁证（重新扫一次名字），把「点到了哪一行」和「点完有没有重排」分开证明：
+    /// 坐标对得上 = 点的是当初算出来的那一行；重扫名字仍唯一 = 列表没有重排。
+    /// 放宽的是**证据来源**，不是身份唯一性 —— 同一个名字在列表里出现两次仍然拒绝。
+    /// </summary>
+    private bool RowStillUniqueAtSamePlace(string displayName,ConversationRow clicked)
+    {
+        try
+        {
+            ObserveListLayout();
+            var rows=ReadConversationRows();
+            var tolerance=Math.Max(4,Px(6));
+            var same=rows.Where(r=>Math.Abs(r.Y-clicked.Y)<=tolerance).ToArray();
+            if(same.Length!=1) return false;
+            var key=MessageFingerprint.NameKey(same[0].Name);
+            if(key.Length==0||key!=MessageFingerprint.NameKey(displayName)) return false;
+            return ConversationListLocator.Unique(rows,displayName) is not null;
+        }
+        catch(WindowAutomationException)
+        {
+            return false;
+        }
+    }
 
     private void RememberHeader(IReadOnlyList<string> lines)
     {
@@ -1012,6 +1290,26 @@ public sealed class OcrInputBackend : IWindowAutomationBackend
     private (int x,int y) MessageCenterWindow() =>
         (Layout.Messages.Left+Layout.Messages.Width/2,Layout.Messages.Top+Layout.Messages.Height/2);
 
+    /// <summary>
+    /// 把会话列表滚回顶部。
+    ///
+    /// 这是给「读可见会话列表」那条路的显式补救：微信把刚收到消息的会话挪到列表第一位，但**不把
+    /// 视口带上去**。列表被滚下去过，那条会话就在视口上方，`list_conversations` 永远读不到它，
+    /// 上层只能把它判成「未找到」——而用户手动点开一次就好了，正是这个原因。
+    ///
+    /// 只由调用方在必要时显式触发。读取路径自己绝不滚：轮询每几秒一次，自己滚就等于一直和
+    /// 用户抢列表。
+    /// </summary>
+    public bool ScrollConversationListToTop()
+    {
+        if (_session is null) return false;
+        ObserveListLayout();
+        ScrollListToTop();
+        _verifiedConversation=null;
+        _verifiedConversationAtUtc=DateTime.MinValue;
+        return true;
+    }
+
     /// <summary>Locate only a freshly observed, unique conversation-list row. Never open global search.</summary>
     public bool SwitchConversation(string displayName)
     {
@@ -1030,7 +1328,7 @@ public sealed class OcrInputBackend : IWindowAutomationBackend
                 ObserveLayout();
                 if (WaitForConversationTitle(displayName, 1200)) return true;
             }
-            catch (WindowAutomationException ex) when (ex.Code is "layout_unverified" or "layout_changed" or "window_changed" or "window_unavailable")
+            catch (WindowAutomationException ex) when (IsRecoverable(ex))
             {
                 // Fall through to a fresh visible-row selection.
             }
@@ -1042,21 +1340,69 @@ public sealed class OcrInputBackend : IWindowAutomationBackend
         {
             ObserveListLayout();
             var rows=ReadConversationRows();
-            var row=ConversationListLocator.Unique(rows,displayName)
-                ?? throw new WindowAutomationException("conversation_not_visible",
-                    $"The requested conversation is not in the visible list. Scroll the conversation list manually and retry. Visible rows: {ConversationListLocator.Describe(rows)}");
+            // 名字是第一把钥匙，头像是第二把。名字读歪时（小璐璐 → 小璐路璐 → 小璐路璐路ONR）
+            // 不再直接判「会话不在列表里」，而是拿上次成功打开它时记下的头像指纹再找一次。
+            var (row,identifiedByAvatar)=LocateVisibleRow(rows,displayName);
+            if(row is null&&clickAttempt==0)
+            {
+                // 第一轮没找到先别报错：会话很可能就在列表里，只是视口停在了下面
+                // （微信把收到消息的会话挪到第一位，但不会把视口带上去）。回顶再看一遍。
+                ScrollListToTop();
+                ObserveListLayout();
+                rows=ReadConversationRows();
+                (row,identifiedByAvatar)=LocateVisibleRow(rows,displayName);
+            }
+            if(row is null)
+                throw new WindowAutomationException("conversation_not_visible",
+                    $"The requested conversation is not in the visible list, and no visible row matched its known avatar — the list was also scrolled back to the top and re-scanned. Visible rows: {ConversationListLocator.Describe(rows)}");
             Input.Click(Layout.List.Left+row.X,Layout.List.Top+row.Y);
             // 校验标题而不只是「布局可用」：会话列表在 OCR 取坐标与点击之间会因新消息重排，
             // 点错行就会静默读到别人的聊天内容（实测发生过：群消息出现在 direct 规则下）。
             if (WaitForConversationTitle(displayName, 3000))
             {
+                RememberAvatar(displayName,row.Avatar);
+                _verifiedConversation=displayName;
+                _verifiedConversationAtUtc=DateTime.UtcNow;
+                return true;
+            }
+            // 头像唯一命中时，图像证据强于会抖的 OCR 文字：这一行的身份已经由头像确定，
+            // 不该再用读不准的页头标题去否定它。复查一次列表即可排除重排。
+            if (identifiedByAvatar&&AvatarStillUnique(displayName,row))
+            {
+                RememberAvatar(displayName,row.Avatar);
+                _verifiedConversation=displayName;
+                _verifiedConversationAtUtc=DateTime.UtcNow;
+                return true;
+            }
+            if (NoisyHeaderIdentifiesUniqueVisibleTarget(displayName))
+            {
+                RememberAvatar(displayName,row.Avatar);
+                _verifiedConversation=displayName;
+                _verifiedConversationAtUtc=DateTime.UtcNow;
+                return true;
+            }
+            // 这里以前直接 return，没有写 _verifiedConversation —— 于是下一句 ReadChatHistory
+            // 走到 VerifyReadTarget 时看到「没有验证过的会话」，把一个**已经打开的**会话报成
+            // conversation_changed。用户看到的是「读不到这条」，而会话其实就开在屏幕上。
+            if (PreviewIdentifiesUniqueVisibleTarget(displayName))
+            {
+                RememberAvatar(displayName,row.Avatar);
+                _verifiedConversation=displayName;
+                _verifiedConversationAtUtc=DateTime.UtcNow;
+                return true;
+            }
+            // 最后一道：文字页头读不出来，但坐标对得上、重扫名字仍唯一。这已经排除了「点错行」
+            // 和「列表重排」两种事故；继续点第二次只会让用户看着同一个会话被反复打开。
+            if (RowStillUniqueAtSamePlace(displayName,row))
+            {
+                RememberAvatar(displayName,row.Avatar);
                 _verifiedConversation=displayName;
                 _verifiedConversationAtUtc=DateTime.UtcNow;
                 return true;
             }
         }
         throw new WindowAutomationException("conversation_unverified",
-            $"The requested conversation did not open after three fresh visible-row clicks. 页头实际读到：{DescribeHeader()}");
+            $"The requested conversation did not open after three fresh visible-row clicks. 页头实际读到：{DescribeHeader()}; preview-proof={_lastPreviewProof}");
     }
 
     public bool VerifyConversationTitle(string displayName) =>
@@ -1070,11 +1416,16 @@ public sealed class OcrInputBackend : IWindowAutomationBackend
     /// 早先只看前台窗口，于是用户只是把微信开着（人去忙别的、或开着某个会话只是挂着）时，
     /// 所有会自动切换会话的读取都被无限期拦住，自动回复等于停摆。
     /// 现在前台但已空闲超过 <see cref="UserBusyIdleSeconds"/> 秒即视为没在操作，读取继续。
+    ///
+    /// 另外排除「前台是微信，但把微信拉到前台的是我们自己」：读取、搜索、发送都会主动激活
+    /// 微信，紧接着的下一次读取不该因为这次激活被判成「用户在用微信」。实测：整理流程连续五个
+    /// 会话都被 wechat_in_use 拒掉，而那正是它自己抢的前台。
     /// </summary>
     public bool UserIsInWeChat() =>
         _hwnd != nint.Zero
         && InputHelper.IsForeground(_hwnd)
-        && InputHelper.IdleSeconds() < UserBusyIdleSeconds;
+        && InputHelper.IdleSeconds() < UserBusyIdleSeconds
+        && !InputHelper.SelfActivatedMoreRecentlyThanInput(UserBusyIdleSeconds);
 
     /// <summary>微信在前台但空闲超过这个秒数，就认为人不在微信前，自动读取可以继续。</summary>
     private const double UserBusyIdleSeconds = 10;
@@ -1405,12 +1756,12 @@ public sealed class OcrInputBackend : IWindowAutomationBackend
     /// 读取一屏：同一窗口位图内完成 OCR 和气泡分组；读取过程不点击消息正文。
     /// 截断用文本块 Y 坐标判断（比像素法可靠：贴顶/贴底即视为气泡被切）。
     /// </summary>
-    private ScreenRead ReadScreenMessages()
+    private ScreenRead ReadScreenMessages(bool verifyTarget=true)
     {
-        VerifyReadTarget();
+        if(verifyTarget) VerifyReadTarget();
         using var bmp=CaptureMessageRegion();
         var rects=_ocr.RecognizePngWithRects(WindowCapture.ToPng(bmp));
-        VerifyReadTarget();
+        if(verifyTarget) VerifyReadTarget();
 
         var sorted = rects.Where(r => !string.IsNullOrWhiteSpace(r.Text)).OrderBy(r => r.Y).ToList();
         var screenHeight = MessageRegionHeight();
@@ -1481,6 +1832,18 @@ public sealed class OcrInputBackend : IWindowAutomationBackend
     private ulong MessageRegionHash()
     {
         using var bmp = CaptureMessageRegion();
+        return RegionHash(bmp);
+    }
+
+    /// <summary>会话列表区截图的降采样灰度哈希，用来判断列表滚动是否还在变化（是否已回顶）。</summary>
+    private ulong ListRegionHash()
+    {
+        using var bmp = CaptureListRegion();
+        return RegionHash(bmp);
+    }
+
+    private static ulong RegionHash(System.Drawing.Bitmap bmp)
+    {
         ulong hash = 1469598103934665603UL; // FNV-1a offset basis
         const int step = 16;
         for (var y = 0; y < bmp.Height; y += step)
@@ -1493,5 +1856,55 @@ public sealed class OcrInputBackend : IWindowAutomationBackend
             }
         }
         return hash;
+    }
+
+    private (int x, int y) ListCenterWindow() =>
+        (Layout.List.Left + Layout.List.Width / 2, Layout.List.Top + Layout.List.Height / 2);
+
+    /// <summary>每轮的滚动量：8 个独立 notch（Qt 对单个大 delta 不线性累加，拆成多个事件才线性）。</summary>
+    private const int ListScrollNotches = 8;
+
+    /// <summary>
+    /// 把会话列表滚回顶部。
+    ///
+    /// 为什么必须这么做：微信收到新消息会把那个会话挪到列表**第一位**，但**不会把视口带上去**。
+    /// 只要列表之前被滚到下面过，新消息那一行就在视口上方，扫当前可见区域永远找不到它 ——
+    /// 用户手动点开一次微信就好了，正是这个原因。驱动原先不滚列表，于是报
+    /// 「可见会话列表中未找到」，收到消息也不处理。
+    ///
+    /// 用「内容不再变化」判断到顶，不猜 notch 总数：会话数量不可知，滚多少次才到顶也不可知。
+    /// </summary>
+    private void ScrollListToTop(int maxRounds = 25)
+    {
+        var (mx, my) = ListCenterWindow();
+        var previous = ListRegionHash();
+        var stableRounds = 0;
+        for (var round = 0; round < maxRounds; round++)
+        {
+            Input.Wheel(mx, my, 120, ListScrollNotches);
+            Thread.Sleep(180); // 等 Qt 重绘
+            var hash = ListRegionHash();
+            if (hash == previous)
+            {
+                if (++stableRounds >= 2) break;
+            }
+            else
+            {
+                stableRounds = 0;
+            }
+            previous = hash;
+        }
+    }
+
+    /// <summary>
+    /// 在当前可见列表里定位目标会话。名字是第一把钥匙，头像是第二把（名字是 OCR 的产物会抖，
+    /// 头像是一张图不会抖，见 <see cref="AvatarFingerprint"/>）。
+    /// </summary>
+    private (ConversationRow? Row, bool ByAvatar) LocateVisibleRow(IReadOnlyList<ConversationRow> rows, string displayName)
+    {
+        var byName = ConversationListLocator.Unique(rows, displayName);
+        if (byName is not null) return (byName, false);
+        var byAvatar = ConversationListLocator.UniqueByAvatar(rows, KnownAvatar(displayName));
+        return (byAvatar, byAvatar is not null);
     }
 }

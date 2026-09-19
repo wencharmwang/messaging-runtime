@@ -136,10 +136,40 @@ public static class InputHelper
     }
 
     /// <summary>前台化窗口。</summary>
-    public static bool BringToForeground(IntPtr hwnd) => SetForegroundWindow(hwnd);
+    public static bool BringToForeground(IntPtr hwnd)
+    {
+        NoteSelfActivation();
+        return SetForegroundWindow(hwnd);
+    }
 
     /// <summary>目标窗口当前是否为前台窗口。</summary>
     public static bool IsForeground(nint hwnd) => GetForegroundWindow() == hwnd;
+
+    // 把微信拉到前台的是我们自己（读取、搜索、发送都会这么做）。前台是微信这件事因此不能
+    // 直接当成"用户在用微信"——实测：整理流程自己激活了微信，紧接着的读取就被判成
+    // wechat_in_use 而拒绝，助手于是把用户点名要读的会话一个个跳过。
+    private static int _selfActivationTick;
+    private static bool _hasSelfActivated;
+
+    /// <summary>记下"这是我们自己抢的前台"，供 <see cref="SelfActivatedMoreRecentlyThanInput"/> 判断。</summary>
+    public static void NoteSelfActivation()
+    {
+        _selfActivationTick = Environment.TickCount;
+        _hasSelfActivated = true;
+    }
+
+    /// <summary>
+    /// 前台是微信，但把它拉到前台的是我们自己，而且用户在之后没有碰过键鼠 —— 这不是
+    /// "用户正在用微信"，是我们在自问自答。
+    /// </summary>
+    public static bool SelfActivatedMoreRecentlyThanInput(double windowSeconds)
+    {
+        if (!_hasSelfActivated) return false;
+        var sinceSelf = unchecked((uint)Environment.TickCount - _selfActivationTick) / 1000.0;
+        if (sinceSelf > windowSeconds) return false;
+        // 用户在我们激活之后又动过键鼠 → 那才是真的在操作，让开。
+        return IdleSeconds() >= sinceSelf;
+    }
 
     /// <summary>
     /// 系统范围的空闲秒数（距最后一次键鼠输入）。用来区分「用户真的在操作微信」和
@@ -183,10 +213,17 @@ public static class InputHelper
     /// 尽力把窗口切到前台。Windows 只允许「前台进程」或「刚收到过输入事件」的进程调用
     /// SetForegroundWindow，后台服务进程会间歇性被拒（实测约半数失败），故逐级兜底；
     /// 每级之后都实际校验前台窗口，全部失败返回 false（调用方不得继续发真实输入）。
+    ///
+    /// <paramref name="allowAggressiveActivation"/> 只对**用户主动下令**的路径开放：最后一级
+    /// 会把目标窗口最小化再还原，这是明确的抢前台动作，屏幕上一定看得见。后台自动回复若走到
+    /// 这一步，就等于在用户打字时把微信甩到最前面 —— 所以后台路径保持 false，宁可直接失败。
     /// </summary>
-    public static bool TryActivate(nint hwnd)
+    public static bool TryActivate(nint hwnd, bool allowAggressiveActivation = false)
     {
         if (IsForeground(hwnd)) return true;
+
+        // 从这里开始，把微信拉到前台的是我们自己。
+        NoteSelfActivation();
 
         // 1) 直接请求。
         SetForegroundWindow(hwnd);
@@ -218,7 +255,8 @@ public static class InputHelper
         NativeMethods.SetForegroundWindow(hwnd);
         if (Settle(hwnd)) return true;
 
-        // 5) 最小化再还原，绕开前台锁。
+        // 5) 最小化再还原，绕开前台锁。这一级在屏幕上完全可见，因此只限用户主动下令的路径。
+        if (!allowAggressiveActivation) return false;
         NativeMethods.ShowWindow(hwnd, NativeMethods.SwMinimize);
         Thread.Sleep(200);
         NativeMethods.ShowWindow(hwnd, NativeMethods.SwRestore);
@@ -227,15 +265,42 @@ public static class InputHelper
         return Settle(hwnd);
     }
 
-    /// <summary>把前台还给调用前的窗口（best effort，失败不影响已完成的发送）。</summary>
+    /// <summary>
+    /// 把前台还给调用前的窗口（best effort，失败不影响已完成的读写）。
+    ///
+    /// 只调一次 SetForegroundWindow 是不够的：前台锁会让后台进程的请求静默失败（见
+    /// <see cref="TryActivate"/> 的实测记录），而这一次失败就把微信留在了用户原本正在打字的
+    /// 应用前面 —— 也就是用户感觉到的「抢焦点」。轻敲 ALT 让本进程被记为「刚收到输入事件」，
+    /// 仍不行就与当前前台线程共享输入队列后重试；这两条是 Windows 允许的合法绕行，不需要
+    /// 把窗口最小化再还原。
+    /// </summary>
     public static void RestoreForeground(nint previous)
     {
         if (previous == IntPtr.Zero || IsForeground(previous)) return;
-        if (!NativeMethods.SetForegroundWindow(previous))
+        if (NativeMethods.SetForegroundWindow(previous) && SettleForeground(previous)) return;
+
+        TapKey(NativeMethods.VkMenu);
+        if (NativeMethods.SetForegroundWindow(previous) && SettleForeground(previous)) return;
+
+        var foreground = NativeMethods.GetForegroundWindow();
+        var foregroundThread = foreground == IntPtr.Zero ? 0 : NativeMethods.GetWindowThreadProcessId(foreground, out _);
+        var attached = foregroundThread != 0 &&
+                       NativeMethods.AttachThreadInput(NativeMethods.GetCurrentThreadId(), foregroundThread, true);
+        try
         {
-            TapKey(NativeMethods.VkMenu);
             NativeMethods.SetForegroundWindow(previous);
         }
+        finally
+        {
+            if (attached) NativeMethods.AttachThreadInput(NativeMethods.GetCurrentThreadId(), foregroundThread, false);
+        }
+    }
+
+    /// <summary>还原路径上的轻量确认：比 <see cref="Settle"/> 短，还原不该再拖慢一次读取。</summary>
+    private static bool SettleForeground(nint hwnd)
+    {
+        Thread.Sleep(120);
+        return IsForeground(hwnd);
     }
 
     private static bool Settle(nint hwnd)
@@ -471,6 +536,18 @@ public static class InputHelper
             throw new WindowAutomationException("foreground_lost", "WeChat lost foreground. No keyboard or global mouse event was sent.");
     }
 
+    private static void RequireForegroundProcess(nint hwnd)
+    {
+        var foreground=GetForegroundWindow();
+        NativeMethods.GetWindowThreadProcessId(hwnd,out var expected);
+        NativeMethods.GetWindowThreadProcessId(foreground,out var actual);
+        // WeChat's search editor is a separate top-level Qt popup. Focusing it necessarily
+        // changes the foreground HWND, but not the owning process. Continue only across that
+        // same-process transition; another application taking focus still stops all input.
+        if(hwnd==0||foreground==0||expected==0||actual!=expected)
+            throw new WindowAutomationException("foreground_lost", "WeChat lost foreground. No keyboard or global mouse event was sent.");
+    }
+
     /// <summary>One chord in one SendInput call; never hold modifiers across sleeps or other actions.</summary>
     public static void SendChordGuarded(nint hwnd, params ushort[] keys)
     {
@@ -480,6 +557,21 @@ public static class InputHelper
         RequireForeground(hwnd);
         if (SendInput((uint)inputs.Length,inputs,Marshal.SizeOf<INPUT>()) != inputs.Length)
             throw new WindowAutomationException("input_failed", "Windows rejected part of the keyboard chord.");
+    }
+
+    /// <summary>
+    /// Send a real shortcut only while foreground still belongs to the same process. WeChat
+    /// changes foreground HWND while constructing its Qt search popup; exact-HWND guarding is
+    /// too strict there, while process guarding still prevents delivery to every other app.
+    /// </summary>
+    public static void SendChordForProcessGuarded(nint hwnd,params ushort[] keys)
+    {
+        RequireForegroundProcess(hwnd);
+        var inputs=keys.Select(key=>new INPUT { type=InputKeyboard,U=new InputUnion { ki=new KEYBDINPUT { wVk=key } } })
+            .Concat(keys.Reverse().Select(key=>new INPUT { type=InputKeyboard,U=new InputUnion { ki=new KEYBDINPUT { wVk=key,dwFlags=KeyeventfKeyup } } })).ToArray();
+        RequireForegroundProcess(hwnd);
+        if(SendInput((uint)inputs.Length,inputs,Marshal.SizeOf<INPUT>())!=inputs.Length)
+            throw new WindowAutomationException("input_failed","Windows rejected part of the keyboard chord.");
     }
 
     /// <summary>
@@ -494,7 +586,7 @@ public static class InputHelper
             throw new WindowAutomationException("input_failed", "Control characters are not valid search text.");
         foreach (var value in text)
         {
-            RequireForeground(hwnd);
+            RequireForegroundProcess(hwnd);
             var inputs=new[]
             {
                 new INPUT { type=InputKeyboard,U=new InputUnion { ki=new KEYBDINPUT { wScan=value,dwFlags=KeyeventfUnicode } } },
@@ -503,7 +595,7 @@ public static class InputHelper
             if (SendInput(2,inputs,Marshal.SizeOf<INPUT>())!=2)
                 throw new WindowAutomationException("input_failed", "Windows rejected part of the Unicode search text.");
         }
-        RequireForeground(hwnd);
+        RequireForegroundProcess(hwnd);
     }
 
     [DllImport("user32.dll")] private static extern nint WindowFromPoint(POINT point);

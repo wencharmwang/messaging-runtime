@@ -13,6 +13,11 @@ internal static class NativeMethods
     [DllImport("user32.dll")]
     public static extern bool IsWindowVisible(nint hWnd);
 
+    // A destroyed handle is the ordinary state of WeChat's transient Qt popups, so callers
+    // must be able to tell "this handle is gone" apart from "this capture failed".
+    [DllImport("user32.dll")]
+    public static extern bool IsWindow(nint hWnd);
+
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     public static extern int GetWindowText(nint hWnd, StringBuilder lpString, int nMaxCount);
 

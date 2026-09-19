@@ -176,7 +176,8 @@ public sealed class ConversationListLocatorTests
     {
         Assert.Equal("树袋熊",ConversationListLocator.CleanName("树袋熊。"));
         Assert.Equal("树袋熊",ConversationListLocator.CleanName("树袋熊?"));
-        Assert.Equal("很长的会话名…",ConversationListLocator.CleanName("很长的会话名.."));
+        Assert.Equal("树袋熊",ConversationListLocator.CleanName("树袋熊.."));
+        Assert.Equal("这是一个确实非常长的会话名…",ConversationListLocator.CleanName("这是一个确实非常长的会话名.."));
     }
 }
 

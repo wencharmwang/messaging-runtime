@@ -23,6 +23,15 @@ public static class WindowCapture
     public static Bitmap CaptureWindow(IntPtr hwnd)
     {
         using var dpi = new DpiAwarenessScope();
+        // A destroyed handle is the ordinary state of WeChat's transient Qt windows: the client
+        // destroys and recreates QWindowToolSaveBits while a search query settles, and a recreated
+        // main window leaves the previous handle dead. That is a window identity change, not a
+        // capture failure, so it must carry the code the self-healing callers already retry on.
+        // Reporting it as capture_failed used to be indistinguishable from a broken screenshot
+        // pipeline, and the read path never recovered.
+        if (!WindowDiscovery.IsWindowAlive(hwnd))
+            throw new WindowAutomationException("window_changed",
+                "The target window no longer exists; re-discover it before capturing.");
         if (!GetWindowRect(hwnd, out var rect)) throw new WindowAutomationException("capture_failed", "Cannot read the target window bounds.");
         var w = Math.Max(1, rect.Right - rect.Left);
         var h = Math.Max(1, rect.Bottom - rect.Top);

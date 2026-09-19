@@ -38,7 +38,11 @@ public sealed class McpTests : IDisposable
         Assert.Equal("messaging-runtime", response["result"]!["serverInfo"]!["name"]!.GetValue<string>());
         Assert.Equal(MessagingMcpServer.ProtocolVersion, response["result"]!["protocolVersion"]!.GetValue<string>());
         var tools = Call("tools/list")["result"]!["tools"]!.AsArray();
-        Assert.Equal(15, tools.Count);
+        // Pinned on purpose: this is the guard against a tool silently appearing in the public
+        // contract. Update the number deliberately whenever the contract changes — the count was
+        // stale at 15 while the tool list had already grown, which is exactly the failure this
+        // assertion exists to catch.
+        Assert.Equal(17, tools.Count);
         Assert.Contains(tools,t=>t!["name"]!.GetValue<string>()=="diagnose_provider");
         var names = tools.Select(t => t!["name"]!.GetValue<string>()).ToArray();
         Assert.Contains("get_messages", names);

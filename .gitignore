@@ -25,3 +25,6 @@ runtime/python/
 .env
 .env.*
 *.token
+
+# Local GPU wheels for on-device OCR acceleration (large binaries, not source)
+_gpu-wheels/

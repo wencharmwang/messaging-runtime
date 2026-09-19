@@ -5,7 +5,7 @@ using WeChatDriver.Core;
 namespace WeChatDriver.Automation;
 
 public sealed record ConversationRow(string Name,int X,int Y,string Preview="",string DisplayTime="",bool HasUnread=false,
-    int NameLeft=0,int NameWidth=0,int NameTop=0,int NameHeight=0);
+    int NameLeft=0,int NameWidth=0,int NameTop=0,int NameHeight=0,string Avatar="");
 
 /// <summary>Keep fresh OCR row coordinates with names. Neither search results nor historical list positions are locators.</summary>
 public static class ConversationListLocator
@@ -57,12 +57,89 @@ public static class ConversationListLocator
             var nameTop=title.Length>0?title.Min(r=>r.Y):anchor.Y;
             var nameHeight=title.Length>0?title.Max(r=>r.Y+r.Height)-nameTop:anchor.Height;
             return new ConversationRow(name,anchor.CenterX,anchor.CenterY,preview,time.Length>0?time:inlineTime,
-                bitmap is not null&&HasRedBadge(bitmap,upper,lower,dpi),nameLeft,nameRight-nameLeft,nameTop,nameHeight);
+                bitmap is not null&&HasRedBadge(bitmap,upper,lower,dpi),nameLeft,nameRight-nameLeft,nameTop,nameHeight,
+                bitmap is null?"":AvatarFingerprint.Capture(bitmap,anchor.CenterY,dpi)??"");
         }).ToArray();
     }
 
     /// <summary>Exposed so a caller can clean a name it read from a narrower crop.</summary>
     public static string CleanName(string raw) => SplitName(raw).Name;
+
+    /// <summary>
+    /// 行名尾部可能粘着时间列残留的日期/时间词。这一条**只用于比对**，不参与身份计算：
+    /// 改身份会让所有已绑定的规则脱钩（身份是名字的哈希），成本远大于收益。
+    /// </summary>
+    private static readonly System.Text.RegularExpressions.Regex RowTimeTail=new(
+        @"(?:星期[一二三四五六日天]?|周[一二三四五六日天]|昨天|今天|前天|\d{1,2}:\d{2}|\d{1,2}[/\-]\d{1,2})+\s*$");
+
+    /// <summary>
+    /// 列表行上的名字，在聊天页头会长成什么样。
+    ///
+    /// 行的名字会把右侧那一列时间/日期粘进来（实测「王丛喜一果爸爸星期」多出来的就是那一列
+    /// 「星期…」的开头），而页头只有名字本身。拿行的名字直接去比页头永远不相等，于是三次点击
+    /// 都确实打开了正确的会话，仍然被判成 conversation_unverified —— 用户看到的是"读不到这条"。
+    /// </summary>
+    public static string HeaderForm(string name)
+    {
+        var trimmed=RowTimeTail.Replace((name??"").Trim(),"").Trim();
+        var cleaned=CleanName(trimmed);
+        return cleaned.Length>0?cleaned:CleanName(name);
+    }
+
+    /// <summary>
+    /// 页头读到的东西是否就是这个会话。只用于核对，不改任何身份。
+    /// 三条判断依次是：页头包含目标名（原有行为）、差一个字符（原有行为）、
+    /// 以及两边都清掉尾部日期/时间噪声后相等（新增，修的就是上面那个 case）。
+    /// </summary>
+    public static bool HeaderMatches(string header,string wanted)
+    {
+        if(string.IsNullOrWhiteSpace(header)||string.IsNullOrWhiteSpace(wanted)) return false;
+        var wantedKey=MessageFingerprint.NameKey(wanted);
+        if(wantedKey.Length==0) return false;
+        if(MessageFingerprint.NameKey(header).Contains(wantedKey,StringComparison.Ordinal)) return true;
+        if(ApproximatelySame(header,wanted)) return true;
+        var right=HeaderForm(wanted);
+        return MessageFingerprint.NameKey(right).Length>=2
+            && MessageFingerprint.NameKey(HeaderForm(header))==MessageFingerprint.NameKey(right);
+    }
+
+    /// <summary>
+    /// A deliberately broader read-only comparison for a list row whose OCR duplicated glyphs
+    /// or appended Latin garbage (for example 小璐璐 -> 小璐路璐路ONR). This result is not enough
+    /// on its own: the caller must prove that exactly one freshly scanned visible row matches the
+    /// header before accepting it. Keeping the uniqueness proof outside this helper prevents this
+    /// tolerance from ever being reused as a send recipient check by accident.
+    /// </summary>
+    public static bool NoisyRowCouldMatchHeader(string header,string rowName)
+    {
+        var headerKey=MessageFingerprint.NameKey(BareName(header));
+        var rowKey=MessageFingerprint.NameKey(HeaderForm(rowName));
+        if(headerKey.Length<3||rowKey.Length<headerKey.Length) return false;
+        // Refuse very weak common-prefix guesses. The whole header must appear in order and make
+        // up at least one third of the noisy row key; duplicated glyphs plus an OCR suffix still pass.
+        if(headerKey.Length*3<rowKey.Length) return false;
+        var index=0;
+        foreach(var ch in rowKey)
+            if(index<headerKey.Length&&headerKey[index]==ch) index++;
+        return index==headerKey.Length;
+    }
+
+    /// <summary>
+    /// Compare the list preview with one OCR'd message bubble. Direction markers, sender labels,
+    /// and truncation punctuation may differ, so containment is intentional. Very short snippets
+    /// are refused because common replies such as “好的” cannot identify a conversation safely.
+    /// The caller must additionally prove uniqueness among the freshly scanned visible rows.
+    /// </summary>
+    public static bool PreviewCouldMatchMessage(string preview,string message)
+    {
+        var body=(message??"").Replace(MessageCleaner.MinePrefix,"",StringComparison.Ordinal)
+            .Replace(MessageCleaner.OtherPrefix,"",StringComparison.Ordinal);
+        var previewKey=MessageFingerprint.NameKey(preview);
+        var messageKey=MessageFingerprint.NameKey(body);
+        if(previewKey.Length<4||messageKey.Length<4) return false;
+        return previewKey.Contains(messageKey,StringComparison.Ordinal)
+            || messageKey.Contains(previewKey,StringComparison.Ordinal);
+    }
 
     /// <summary>
     /// A name without the trailing group member count: a chat header reads "新疆羊肉串( 14"
@@ -98,7 +175,15 @@ public static class ConversationListLocator
         // it is turned into an ellipsis, the user-commanded search literally searches for `树袋熊…`
         // and cannot find the contact. Preserve actual dot/ellipsis truncation, but drop `。`.
         name=name.TrimEnd('。');
-        name=System.Text.RegularExpressions.Regex.Replace(name,@"[.．·…]+$","…");
+        var trailingDots=System.Text.RegularExpressions.Regex.Match(name,@"[.．·…]+$");
+        if(trailingDots.Success)
+        {
+            var stem=name[..trailingDots.Index].TrimEnd();
+            // WeChat truncates genuinely long rows with an ellipsis. On a short name the same
+            // glyphs are instead how OCR represents an unsupported trailing emoji (树袋熊🐻 ->
+            // 树袋熊..). Searching for the fabricated ellipsis cannot find the contact.
+            name=MessageFingerprint.NameKey(stem).Length<=8 ? stem : stem+"…";
+        }
         if(name.Length==0) name=raw.Trim();
         return (name.TrimEnd('?','？','\ufffd','\u25a1').Trim(),inline);
     }
@@ -153,6 +238,22 @@ public static class ConversationListLocator
         var near=rows.Where(r=>ApproximatelySame(r.Name,name)).ToArray();
         if(near.Length>1) throw new WeChatDriver.Windows.WindowAutomationException("ambiguous_conversation","Several visible conversation rows are close to the requested name.");
         return near.Length==1 ? near[0] : null;
+    }
+
+    /// <summary>
+    /// 用头像指纹在可见行里找会话。这是名字之外的第二把钥匙：名字是 OCR 的产物，会抖
+    /// （小璐璐 → 小璐路璐），头像是一张图，不抖。
+    ///
+    /// 只在**唯一命中**时返回。头像重复是真实存在的（两个人都没设头像、或用了同一张图），
+    /// 有歧义时必须报歧义 —— 猜错会话等于把回复发给另一个人。
+    /// </summary>
+    public static ConversationRow? UniqueByAvatar(IReadOnlyList<ConversationRow> rows,string? fingerprint)
+    {
+        if(string.IsNullOrWhiteSpace(fingerprint)) return null;
+        var matches=rows.Where(r=>r.Avatar.Length>0&&AvatarFingerprint.Matches(r.Avatar,fingerprint)).ToArray();
+        if(matches.Length==1) return matches[0];
+        if(matches.Length>1) throw new WeChatDriver.Windows.WindowAutomationException("ambiguous_conversation","Several visible conversation rows share the same avatar.");
+        return null;
     }
 
     /// <summary>
