@@ -275,11 +275,20 @@ public sealed class WindowsWeChatDriver(Func<OcrInputBackend> factory) : IWeChat
             {
             if (allowGlobalSearch) Backend.RestoreWindowSession();
             Ready();
-            var selected = allowGlobalSearch
-                ? Backend.SelectConversationByGlobalSearch(displayName)
-                : Backend.SelectConversationForDirectSend(displayName);
-            if (!selected)
-                throw new MessagingException("conversation_not_visible", "Could not select the requested conversation row.");
+            // 当前打开的就是目标会话时，直接写草稿发送——不搜索、不切换、不抢焦点。
+            // 页头 OCR 读得出且确为目标才走这条快路径；读不出或不是目标则回落定位
+            // （搜索/列表点击），所以 OCR 失败不会阻断，识别成功则完全后台发送。
+            var alreadyOpen = false;
+            try { alreadyOpen = HeaderIsExactly(Backend.OpenConversationTitle(), displayName); }
+            catch { alreadyOpen = false; }
+            if (!alreadyOpen)
+            {
+                var selected = allowGlobalSearch
+                    ? Backend.SelectConversationByGlobalSearch(displayName)
+                    : Backend.SelectConversationForDirectSend(displayName);
+                if (!selected)
+                    throw new MessagingException("conversation_not_visible", "Could not select the requested conversation row.");
+            }
             var key = new ConversationKey("", displayName, null);
             var sendAttempt = Backend.WriteAndSendDirect(text);
             submissionStarted = sendAttempt.SubmissionStarted;
