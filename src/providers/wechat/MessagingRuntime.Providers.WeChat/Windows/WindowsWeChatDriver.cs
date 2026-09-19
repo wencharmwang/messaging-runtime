@@ -279,7 +279,15 @@ public sealed class WindowsWeChatDriver(Func<OcrInputBackend> factory) : IWeChat
             // 页头 OCR 读得出且确为目标才走这条快路径；读不出或不是目标则回落定位
             // （搜索/列表点击），所以 OCR 失败不会阻断，识别成功则完全后台发送。
             var alreadyOpen = false;
-            try { alreadyOpen = HeaderIsExactly(Backend.OpenConversationTitle(), displayName); }
+            try
+            {
+                var openTitle = Backend.OpenConversationTitle();
+                // 页头 OCR 可能少/多读一个字符（实测 Wencharm 被读成 Wencham），
+                // 严格全等之外再容忍 ±1 字符的插入/删除；差异更大才回落搜索。
+                alreadyOpen = openTitle is not null
+                    && (HeaderIsExactly(openTitle, displayName)
+                        || ConversationListLocator.ApproximatelySame(openTitle, displayName));
+            }
             catch { alreadyOpen = false; }
             if (!alreadyOpen)
             {
