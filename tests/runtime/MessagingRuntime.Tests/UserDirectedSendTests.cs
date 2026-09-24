@@ -150,4 +150,45 @@ public sealed class UserDirectedSendTests : IDisposable
         public ApprovalInfo Describe(string requestId) => new("runtime_desktop", "visible", "Query get_send_status after user action.");
     }
     public void Dispose() { _providers.Dispose(); _store.Dispose(); }
+
+    /// <summary>worker 通道：授权函数说不行时，用户发起的发送回退到策略判定。</summary>
+    private MessagingService WorkerChannel(SendMode mode = SendMode.UserDirected)
+        => new(_providers, _store, new(mode), "auto-reply",
+            sendAuthorization: _ => throw new MessagingException(
+                "policy_denied", "Automatic reply requires an enabled rule and its exact unexpired outbox request."));
+
+    [Fact]
+    public void UserDirectedSendFallsBackToPolicyOnTheAutoReplyChannel()
+    {
+        // 用户自己在界面上点的那一下，不该被"自动回复必须精确匹配任务"这条约束拦住。
+        var runtime = WorkerChannel(SendMode.UserDirected);
+        var status = runtime.SendMessage("test-main", "a", "text", Guid.NewGuid().ToString(),
+            origin: SendOrigin.UserRequest).Status;
+        Assert.Equal("sent", status);
+    }
+
+    [Fact]
+    public void AgentProposedSendOnTheAutoReplyChannelIsStillDenied()
+    {
+        // 自动回复（agent 主动）一点没放松：仍然必须精确匹配那条 outbox 任务。
+        var runtime = WorkerChannel(SendMode.UserDirected);
+        var error = Assert.Throws<MessagingException>(() =>
+            runtime.SendMessage("test-main", "a", "text", Guid.NewGuid().ToString(),
+                origin: SendOrigin.AgentProposed));
+        Assert.Equal("policy_denied", error.Code);
+    }
+
+    [Theory]
+    [InlineData(SendMode.ReadOnly)]
+    [InlineData(SendMode.AllowList)]
+    public void UserDirectedSendStillObeysARestrictiveLocalPolicy(SendMode mode)
+    {
+        // 回退只是"再问一次策略"，不是"放行" —— 配置成只读/白名单时照样拒。
+        var runtime = WorkerChannel(mode);
+        var error = Assert.Throws<MessagingException>(() =>
+            runtime.SendMessage("test-main", "a", "text", Guid.NewGuid().ToString(),
+                origin: SendOrigin.UserRequest));
+        Assert.Equal("policy_denied", error.Code);
+        Assert.Equal(0, _provider.SendCalls);
+    }
 }

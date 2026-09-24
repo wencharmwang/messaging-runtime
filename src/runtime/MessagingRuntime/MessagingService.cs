@@ -104,6 +104,30 @@ public sealed class MessagingService(ProviderManager providers, MessageStore sto
         return store.Search(provider, query, conversationId, limit);
     });
 
+    /// <summary>
+    /// 一次发送是否被允许。
+    ///
+    /// 授权函数（自动回复那个通道用的）要求"与某条已启用规则的任务**完全一致**" ——
+    /// 这条约束只对 **agent 主动发起**的回复成立。用户自己在界面上点的那一下
+    /// （origin = UserRequest）不是自动回复，也不该被那条约束拦住：它按运行时配置的策略判定
+    /// （send_mode = user_directed 时批准；换成 read_only / allow_list 依然会被拒）。
+    ///
+    /// 所以：授权函数说不行时，**只在 UserRequest 的情况下**回头问一次策略。
+    /// 自动回复走的始终是 AgentProposed，一点没放松。
+    /// </summary>
+    private string AuthorizeSend(SendRequest request, SendOrigin origin)
+    {
+        if (sendAuthorization is null) return policy.Evaluate(request, origin);
+        try
+        {
+            return sendAuthorization(request);
+        }
+        catch (MessagingException error) when (origin == SendOrigin.UserRequest && error.Code == "policy_denied")
+        {
+            return policy.Evaluate(request, origin);
+        }
+    }
+
     public SendOutcome SendMessage(string provider, string conversationId, string text, string requestId, string? replyTo = null,
         SendOrigin origin = SendOrigin.AgentProposed)
         => Run(replyTo is null ? "send_message" : "reply_message", provider, conversationId, () =>
@@ -114,7 +138,7 @@ public sealed class MessagingService(ProviderManager providers, MessageStore sto
         var p = providers.Get(provider);
         Require(replyTo is null ? p.Info.Capabilities.SendText : p.Info.Capabilities.Reply, replyTo is null ? "send_text" : "reply");
         var request = new SendRequest(guid.ToString("D"), agentId, provider, conversationId, text, replyTo);
-        var status = sendAuthorization is null ? policy.Evaluate(request, origin) : sendAuthorization(request);
+        var status = AuthorizeSend(request, origin);
         var existing = store.FindSendRequest(request.RequestId);
         if (existing is not null) request = request with { ConversationTitle = existing.ConversationTitle };
         else if (p.Info.Capabilities.ListConversations)
