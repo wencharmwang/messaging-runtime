@@ -120,7 +120,16 @@ public static class Program
                     // yield while the person is working in WeChat; every other MCP client on this
                     // host is answering a person who just asked for something, and must not be
                     // refused because of their own activity.
-                    worker = new MessagingMcpServer(new MessagingService(providers, store, new(SendMode.ReadOnly),
+                    // 用**配置里的策略**，不是硬编码的 ReadOnly。
+                    //
+                    // worker 通道上来有两类请求：
+                    //  - 自动回复（agent 主动）：走下面的 sendAuthorization，要求与某条已启用规则
+                    //    的任务完全一致 —— 一点没放松；
+                    //  - 用户自己在界面上点的那一下（origin = UserRequest）：授权函数按自动回复的
+                    //    规矩拒掉后，MessagingService 会**只在 UserRequest 时**回头问策略，
+                    //    这时问的就是这里传进去的策略（配置是 user_directed → 放行）。
+                    // 以前这里写死 ReadOnly，于是那次回退等于又撞一次墙，用户点什么都被拒。
+                    worker = new MessagingMcpServer(new MessagingService(providers, store, config.Policy,
                         "auto-reply", sendAuthorization: authorization.Evaluate, operationGate: operationGate,
                         backgroundReads: true));
                 }
