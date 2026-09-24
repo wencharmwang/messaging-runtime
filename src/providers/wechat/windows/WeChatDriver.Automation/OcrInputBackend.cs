@@ -686,8 +686,33 @@ public sealed class OcrInputBackend : IWindowAutomationBackend
         if (pid == 0) return false;
         var hwnd = WindowDiscovery.FindMainWindowLoose(pid);
         if (hwnd == nint.Zero) return false;
-        if (WindowDiscovery.IsWindowUsable(hwnd)) return true;
-        return WindowDiscovery.TryRestoreWindow(hwnd);
+        if (!WindowDiscovery.IsWindowUsable(hwnd) && !WindowDiscovery.TryRestoreWindow(hwnd)) return false;
+        // 窗口"存在"不等于"画出来了"：从托盘恢复的 Qt/GPU 窗口会先是一整块空白
+        //（实测：白屏、点一下才有响应）。后台写文字和 OCR 读布局都需要**真实画面**，
+        // 所以这里等到它真的画出来再返回 —— 否则上层拿到的是"布局认不出"这种把人引偏的错误。
+        for (var attempt = 0; attempt < 12; attempt++)
+        {
+            if (WindowHasPaintedContent(hwnd)) return true;
+            Thread.Sleep(250);
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// 整窗截一张，判断是否已经画出内容（而不是一整块纯色）。
+    /// 未绘制的窗口截出来是空白的 —— 这正是 OCR 和投递式输入都失效的原因。
+    /// </summary>
+    private static bool WindowHasPaintedContent(nint hwnd)
+    {
+        try
+        {
+            using var frame = WindowCapture.CaptureWindow(hwnd);
+            return RegionHasInk(frame);
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     // 全局搜索浮层里「结果行」所在分区的标题；标题自身不是结果行。
@@ -1168,6 +1193,63 @@ public sealed class OcrInputBackend : IWindowAutomationBackend
         _lastHeaderLines.Length == 0 ? "(页头没有读到任何文字)" : string.Join(" / ", _lastHeaderLines.Take(6));
 
     /// <summary>Write an automatic reply without OCR/title readback, then submit it.</summary>
+    /// <summary>
+    /// 写文字之前的就绪检查。
+    ///
+    /// 后台写文字是**向窗口投递消息**（background_window_messages）；向最小化、或者还没绘制出
+    /// 内容的窗口投递，字符不会落地 —— 表现就是"输入框一直是空的"，上层只能报
+    /// "未探测到绿色发送按钮"甚至"这条回复没有确认发出"（实测：窗口从托盘恢复后是**白屏**，
+    /// 点一下有响应但画面是空的）。
+    ///
+    /// 所以：窗口不可用就先恢复；再**等画面真的画出来**（有界等待，不无限卡）。
+    /// </summary>
+    private void EnsureReadyForWriting(string what)
+    {
+        var pid = WindowDiscovery.FindWeChatProcessIds().FirstOrDefault();
+        if (pid != 0)
+        {
+            var hwnd = WindowDiscovery.FindMainWindowLoose(pid);
+            if (hwnd != nint.Zero && !WindowDiscovery.IsWindowUsable(hwnd))
+            {
+                WindowDiscovery.TryRestoreWindow(hwnd);
+                Thread.Sleep(250);
+            }
+        }
+        for (var attempt = 0; attempt < 8; attempt++)
+        {
+            try
+            {
+                using var frame = CaptureComposerRegion();
+                if (RegionHasInk(frame)) return;
+            }
+            catch (WindowAutomationException) { /* 布局还没建立，继续等 */ }
+            catch (System.ComponentModel.Win32Exception) { /* 窗口正在重建，继续等 */ }
+            Thread.Sleep(250);
+        }
+        throw new WindowAutomationException("window_blank",
+            $"微信窗口还没绘制出内容，暂时没法{what}。把微信窗口从托盘打开、不要让它最小化，就会好。");
+    }
+
+    /// <summary>
+    /// 截出来这一小块里有没有"内容"（而不是一整块同色）。
+    ///
+    /// 用来判断窗口**是否已经画出来** —— 未绘制的窗口截出来是纯色（白屏），
+    /// 已绘制的空输入框至少还有边框/占位文字。隔 3 像素采样，开销可以忽略。
+    /// </summary>
+    private static bool RegionHasInk(System.Drawing.Bitmap region)
+    {
+        if (region.Width < 8 || region.Height < 8) return false;
+        var corner = region.GetPixel(2, 2);
+        for (var y = 2; y < region.Height; y += 3)
+        for (var x = 2; x < region.Width; x += 3)
+        {
+            var pixel = region.GetPixel(x, y);
+            var delta = Math.Abs(pixel.R - corner.R) + Math.Abs(pixel.G - corner.G) + Math.Abs(pixel.B - corner.B);
+            if (delta > 60) return true;
+        }
+        return false;
+    }
+
     public DirectSendAttempt WriteAndSendDirect(string text)
     {
         if (_session is null)
@@ -1179,24 +1261,34 @@ public sealed class OcrInputBackend : IWindowAutomationBackend
         {
             var cx = Layout.Composer.Left + Layout.Composer.Width / 2;
             var cy = Layout.Composer.Top + Layout.Composer.Height / 2;
-            if (BackgroundWriting)
+            // 投递式输入失败是**静默**的：文字没进去、什么都不会报。所以两件事都要做 ——
+            // 写之前等窗口真的画出来，写之后用"绿按钮出现"当作文字已进输入框的证据，
+            // 没出现就重试一次（重新等就绪 + 重写），最后才认输并说清原因。
+            int buttonX = 0, buttonY = 0;
+            var found = false;
+            for (var attempt = 0; attempt < 2 && !found; attempt++)
             {
-                Input.Click(cx, cy);
-                Input.WriteText(cx, cy, text, static () => { });
+                EnsureReadyForWriting("发送");
+                if (BackgroundWriting)
+                {
+                    Input.Click(cx, cy);
+                    Input.WriteText(cx, cy, text, static () => { });
+                }
+                else
+                {
+                    Input.ActivateForWriting();
+                    Input.Click(cx, cy, background: false);
+                    InputHelper.SetClipboardText(text);
+                    Input.Chord(0x11, 0x56);
+                }
+                Thread.Sleep(150);
+                using var button = WindowCapture.CaptureRegionFromBottom(
+                    _hwnd, SendX, SendW, Px(SendCenterFromBottomPx), Px(SendButtonHeightPx));
+                (buttonX, buttonY, found) = FindGreenButtonCenter(button);
             }
-            else
-            {
-                Input.ActivateForWriting();
-                Input.Click(cx, cy, background: false);
-                InputHelper.SetClipboardText(text);
-                Input.Chord(0x11, 0x56);
-            }
-            Thread.Sleep(150);
-            using var button = WindowCapture.CaptureRegionFromBottom(
-                _hwnd, SendX, SendW, Px(SendCenterFromBottomPx), Px(SendButtonHeightPx));
-            var (buttonX, buttonY, found) = FindGreenButtonCenter(button);
             if (!found)
-                return new(false, OperationResult.Fail(FailureCode.SendControlUnknown, "输入后未探测到绿色发送按钮"));
+                return new(false, OperationResult.Fail(FailureCode.WriteFailed,
+                    "文字没有进入微信输入框（窗口未就绪或被其他程序抢了焦点），这条没有发送。"));
             submissionStarted = true;
             if (BackgroundWriting)
             {
