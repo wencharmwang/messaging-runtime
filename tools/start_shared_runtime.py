@@ -32,6 +32,34 @@ class DesktopNotReady(RuntimeError):
     """This window station cannot see user windows yet; retry later."""
 
 
+def describe_exit_code(code):
+    """Say *why* the Host ended, so a routine restart does not read as a crash.
+
+    The Host's own code only ever returns 0 (clean) or 1 (a caught startup or
+    configuration error) and never -1. So 0xFFFFFFFF can only come from
+    TerminateProcess(-1) — which is exactly what Stop-Process and .NET
+    Process.Kill() write. That is the footprint of restart.ps1 reaping the old
+    Host, not a fault inside the Host. Logged as a bare "Host exited with code
+    4294967295" it reads like a crash and sends the next debugging session
+    chasing a bug that does not exist.
+    """
+    unsigned = code & 0xFFFFFFFF
+    if unsigned == 0:
+        return 'Host stopped cleanly (exit code 0).'
+    if unsigned == 0xFFFFFFFF:
+        return ('Host was terminated from outside (exit code 0xFFFFFFFF = -1) — '
+                'that is Stop-Process/taskkill, i.e. a restart, not a Host fault.')
+    return f'Host exited with code {code} (0x{unsigned:08X}).'
+
+
+class HostExited(RuntimeError):
+    """The Host this supervisor started is gone; carries the decoded reason."""
+
+    def __init__(self, code):
+        self.code = code & 0xFFFFFFFF
+        super().__init__(describe_exit_code(code))
+
+
 def active_console_session():
     """Session id of the interactive console, or None when nobody is logged on."""
     kernel = ctypes.WinDLL('kernel32', use_last_error=True)
@@ -241,7 +269,7 @@ if __name__ == '__main__':
             code = process.wait()
             if time.monotonic() - started_at >= 60:
                 consecutive_failures = 0
-            raise RuntimeError(f'Host exited with code {code}.')
+            raise HostExited(code)
         except DesktopNotReady as error:
             # Transient by definition: a logon-time or otherwise non-interactive
             # window station usually becomes interactive shortly. Wait it out and
