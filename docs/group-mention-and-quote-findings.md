@@ -1,0 +1,109 @@
+# 群聊 @ 与引用消息：探针实测结论
+
+日期：2026-10-02。状态：**调研完成，尚未实施**。测试环境：微信 4.1.15、Windows、窗口 999×810 @dpi96。
+
+探针：`tests/providers/wechat/WeChatDriver.Automation.Tests/AffordanceProbeTests.cs`（opt-in）
+运行：
+
+```powershell
+$env:WECHAT_AFFORDANCE_PROBE="1"; $env:WECHAT_AFFORDANCE_PROBE_LIVE="1"; $env:WECHAT_AFFORDANCE_PROBE_TITLE="JARVIS"
+dotnet test tests/providers/wechat/WeChatDriver.Automation.Tests -c Debug --filter "FullyQualifiedName~AffordanceProbe"
+```
+
+截图与 report.txt 落在 `artifacts/affordance-probe/`。**它绝不按回车、绝不点发送。**
+
+---
+
+## 一、引用：**确认可行** ✅
+
+**右键任何一条消息，菜单里确实有「引用」。** 实测菜单（截图见 `popup-右键菜单-*.png`）：
+
+```
+复制
+放大阅读
+翻译
+搜一搜
+──────────────
+转发...
+收藏
+多选
+提醒
+引用          ← 第 9 项
+──────────────
+删除（红色）
+```
+
+### 这对实现意味着什么
+
+1. **菜单是独立顶层窗口**，class 含 `QWindowToolSaveBits`，位置就在点击处右侧
+   （实测 210×398 @(1003,643)）。
+   → 它可以和主窗口一样**按 HWND 绑定并用贴消息点击**，不需要全局鼠标输入 ——
+   这与现有 backend「不做全局输入、永不干扰用户」的设计**完全一致**，不用破红线。
+2. **菜单项可用 OCR 文本定位**（「引用」两个字认得出来）。
+   注意：引用项前面的图标 `❝` 会被 OCR 读成 `@`（所以日志里出现「@ 引用」）—— 别把它当成 @ 功能。
+3. 菜单**每次重建、句柄都不同**（实测 0x2A03C6 → 0x2B03C6 → 0x260588 → 0x110642），
+   所以每轮操作前都要重新枚举（`WindowDiscovery.FindSearchPopup` 的注释里记的就是这件事）。
+
+### 实现要点（待做）
+
+- `IWeChatDriver` / `WindowsWeChatDriver` / `OcrInputBackend` 增加「引用发送」路径：
+  右键目标气泡 → 枚举 `QWindowToolSaveBits` → OCR 找「引用」→ 点它 → 写正文 → 发送。
+- **定位「引用哪条」是难点**：现在只有"读最新一条"+滚动标定；要按消息文本在屏幕上匹配坐标。
+- `WeChatProvider` 声明 `Reply: true`（现在没有，所以 `reply_message` 会被能力检查拒掉）。
+- 自动回复要能引用，还得放宽 `AutoReplyAuthorization`（它现在**显式拒绝** `ReplyTo`）。
+
+---
+
+## 二、@ 成员：**尚未验证** ⚠️
+
+探针能稳定做到：定位窗口 → OCR 布局 → 右键弹菜单 → OCR 菜单。
+**但敲 `@` 这一步卡住了：合成键盘输入进不了输入框。**
+
+实测矩阵（都试过，都失败）：
+
+| 机制 | 结果 |
+| --- | --- |
+| 真实按键 `a`（keybd_event / Chord） | 输入框仍为空 |
+| 真实按键 `Shift+2`（`@`） | 输入框仍为空 |
+| 剪贴板 + Ctrl+V 粘贴 `a` / `@` | 输入框仍为空 |
+| 贴 `WM_CHAR '@'` | 输入框仍为空 |
+| **真实鼠标右键（同一进程、同一时刻）** | **成功弹出菜单** ✅ |
+
+已排除的原因：
+- **不是坐标问题** —— `WindowFromPoint` 验证过：消息区与输入框中心都命中微信主窗口 0x90596。
+- **不是前台问题** —— 每次输入前 `IsForeground(hwnd)` 都是 True，`ActivateForWriting()` 也调了。
+- **不是沙箱** —— 绕开沙箱跑，结果一样。
+- **不是漏了生产代码的准备步骤** —— 已照抄 `OcrInputBackend` 的前台写入序列
+  （`ActivateForWriting` → `Click(background:false)` → `SetClipboardText` → `Ctrl+V`）。
+
+**最可能的解释**：这个测试进程注入的键盘事件被系统/安全软件过滤掉了（鼠标放行、键盘拦截是常见策略），
+而**真实产品里的发送是正常的**（用户的自动回复一直在发出消息）。所以这更像是**测试挂载方式的限制，
+而不是产品能力限制**。
+
+**下一步（要做的就一件事）**：把同一段逻辑从**真实产品进程**里跑一次（例如给 driver 加一个隐藏的命令行开关），
+而不是从 `dotnet test` 里跑。那样才能确认 @ 的成员选择器长什么样、以及"粘贴 @ 能否唤起它"。
+
+> 顺带一个待验的假设：**粘贴的 `@` 能不能唤起成员选择器**。
+> 如果不能，就必须真的敲键 —— 那就得先解决上面这个键盘注入问题。
+
+---
+
+## 三、副产品发现
+
+- 该账号的会话列表里有「**微信团队**：当前账号存在安全风险，部分功能暂时无法正常使用」。
+  与风控相关，已单独提醒用户。
+- 菜单里还有「**提醒**」——如果以后要做"稍后提醒我"，入口是现成的。
+- 页头 OCR 会把 `JARVIS` 读成 `JARVlS`（大写 I → 小写 l）。项目里已有同类记录
+  （Wencharm → Wencham），所以任何标题比对都要容忍 OCR 混淆，别用严格相等。
+
+---
+
+## 四、常用坑（本轮实测踩到的）
+
+1. `InputHelper.ToScreenPoint(hwnd, rx, ry)` 收的是**比例 0~1**，不是像素。把像素当比例传，
+   右键会落到窗口外面 —— 菜单不弹，还会被误判成"没有这个功能"。
+2. 微信浮层**不是主窗口的子窗口**，是独立顶层窗口，class 含 `QWindowToolSaveBits`。
+3. 浮层**句柄每次都变**，不能缓存。
+4. 窗口可能被收进托盘；探针要先 `TryRestoreWindow` 再干活。
+5. 消息区 OCR 里，**发送者昵称标签和时间戳都很短，正文最长** —— 要挑正文当右键目标，
+   按长度挑比按位置挑可靠。
