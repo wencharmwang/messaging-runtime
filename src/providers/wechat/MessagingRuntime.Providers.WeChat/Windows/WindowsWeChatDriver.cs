@@ -301,7 +301,7 @@ public sealed class WindowsWeChatDriver(Func<OcrInputBackend> factory) : IWeChat
             var sendAttempt = Backend.WriteAndSendDirect(text);
             submissionStarted = sendAttempt.SubmissionStarted;
             if (!sendAttempt.Result.Succeeded)
-                throw new MessagingException("send_failed", "The driver could not confirm the send action.");
+                throw new MessagingException(sendAttempt.Code ?? "send_failed", sendAttempt.Result.Failure?.Message ?? "The driver could not confirm the send action.");
             // Qt can keep the enabled button painted briefly after processing the
             // click. Poll the button state only; direct mode intentionally avoids
             // OCR/UIA draft reads. Never click a second time during verification.

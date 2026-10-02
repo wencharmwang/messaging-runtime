@@ -10,7 +10,7 @@ namespace WeChatDriver.Automation;
 /// </summary>
 public sealed class OcrInputBackend : IWindowAutomationBackend
 {
-    public sealed record DirectSendAttempt(bool SubmissionStarted, OperationResult Result);
+    public sealed record DirectSendAttempt(bool SubmissionStarted, OperationResult Result, string? Code = null);
     private readonly IOcrEngine _ocr;
     private readonly bool _ownsOcr;
     private WeChatWindowSession? _session;
@@ -165,7 +165,9 @@ public sealed class OcrInputBackend : IWindowAutomationBackend
 
     // Pane boundaries are detected in the captured bitmap; no proportional sidebar crop is trusted.
     private const double SendX=0.88,SendW=0.11;
-    private const int SendCenterFromBottomPx=57,SendButtonHeightPx=40;
+    // 4.1.15 moves Send into the bottom toolbar. Cover both old and new
+    // positions while keeping the crop restricted to the right edge.
+    private const int SendCenterFromBottomPx=10,SendButtonHeightPx=90;
 
     // 滚动标定：基准窗口 1118×809（消息区高 542px）下，4 notch 滚约 60% 屏、保留 2~3 条重叠锚点（实测防跳过下限）。
     // 微信 Qt 对单次滚轮事件的大 delta 不线性累加，故每次滚动都拆成多个 1-notch 事件（每次独立触发一次滚动）。
@@ -1219,8 +1221,14 @@ public sealed class OcrInputBackend : IWindowAutomationBackend
         {
             try
             {
-                using var frame = CaptureComposerRegion();
-                if (RegionHasInk(frame)) return;
+                // A healthy EMPTY editor may be perfectly uniform. Validate the full
+                // pane boundaries, not whether the draft already contains ink.
+                Input.Validate();
+                using var frame = WindowCapture.CaptureWindow(_hwnd);
+                var observed = WeChatLayout.Detect(frame, _dpi);
+                Input.ExpectGeometry(observed.Width, observed.Height, observed.Dpi);
+                _layout = observed;
+                return;
             }
             catch (WindowAutomationException) { /* 布局还没建立，继续等 */ }
             catch (System.ComponentModel.Win32Exception) { /* 窗口正在重建，继续等 */ }
@@ -1259,28 +1267,32 @@ public sealed class OcrInputBackend : IWindowAutomationBackend
         var submissionStarted = false;
         try
         {
+            EnsureReadyForWriting("发送");
+            using (var existing = WindowCapture.CaptureRegionFromBottom(
+                _hwnd, SendX, SendW, Px(SendCenterFromBottomPx), Px(SendButtonHeightPx)))
+                if (FindGreenButtonCenter(existing).found)
+                    return new(false, OperationResult.Fail(FailureCode.WriteFailed,
+                        "微信输入框已有草稿，请先处理。"), "composer_not_empty");
             var cx = Layout.Composer.Left + Layout.Composer.Width / 2;
             var cy = Layout.Composer.Top + Layout.Composer.Height / 2;
-            // 投递式输入失败是**静默**的：文字没进去、什么都不会报。所以两件事都要做 ——
-            // 写之前等窗口真的画出来，写之后用"绿按钮出现"当作文字已进输入框的证据，
-            // 没出现就重试一次（重新等就绪 + 重写），最后才认输并说清原因。
+            if (BackgroundWriting)
+            {
+                Input.Click(cx, cy);
+                Input.WriteText(cx, cy, text, static () => { });
+            }
+            else
+            {
+                Input.ActivateForWriting();
+                Input.Click(cx, cy, background: false);
+                InputHelper.SetClipboardText(text);
+                Input.Chord(0x11, 0x56);
+            }
+            // Poll for rendering only. Never inject the text a second time: a
+            // delayed/partial first write must not turn into a duplicate draft.
             int buttonX = 0, buttonY = 0;
             var found = false;
-            for (var attempt = 0; attempt < 2 && !found; attempt++)
+            for (var attempt = 0; attempt < 8 && !found; attempt++)
             {
-                EnsureReadyForWriting("发送");
-                if (BackgroundWriting)
-                {
-                    Input.Click(cx, cy);
-                    Input.WriteText(cx, cy, text, static () => { });
-                }
-                else
-                {
-                    Input.ActivateForWriting();
-                    Input.Click(cx, cy, background: false);
-                    InputHelper.SetClipboardText(text);
-                    Input.Chord(0x11, 0x56);
-                }
                 Thread.Sleep(150);
                 using var button = WindowCapture.CaptureRegionFromBottom(
                     _hwnd, SendX, SendW, Px(SendCenterFromBottomPx), Px(SendButtonHeightPx));
@@ -1288,7 +1300,7 @@ public sealed class OcrInputBackend : IWindowAutomationBackend
             }
             if (!found)
                 return new(false, OperationResult.Fail(FailureCode.WriteFailed,
-                    "文字没有进入微信输入框（窗口未就绪或被其他程序抢了焦点），这条没有发送。"));
+                    "文字没有进入微信输入框，这条没有发送。"), "input_failed");
             submissionStarted = true;
             if (BackgroundWriting)
             {
@@ -1298,13 +1310,15 @@ public sealed class OcrInputBackend : IWindowAutomationBackend
             }
             else
             {
-                Input.Chord(0x0D);
+                var x = (int)(Layout.Width * SendX) + buttonX;
+                var y = Layout.Height - Px(SendCenterFromBottomPx) - Px(SendButtonHeightPx) + buttonY;
+                Input.Click(x, y, background: false);
             }
             return new(true, OperationResult.Ok(0.8));
         }
         catch (WindowAutomationException ex)
         {
-            return new(submissionStarted, OperationResult.Fail(FailureCode.SendFailed, ex.Message));
+            return new(submissionStarted, OperationResult.Fail(FailureCode.SendFailed, ex.Message), ex.Code);
         }
         catch (Exception ex)
         {

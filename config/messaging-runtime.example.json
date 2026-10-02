@@ -2,7 +2,7 @@
   "agent_id": "local-agent",
   "data_directory": "../.runtime-data",
   "approval_ui": "desktop",
-  "wechat_write_mode": "background",
+  "wechat_write_mode": "foreground",
   "auto_reply_database": "../../message-agent/data/reply.db",
   "auto_reply_token_file": "../../message-agent/data/worker.token",
   "policy": {

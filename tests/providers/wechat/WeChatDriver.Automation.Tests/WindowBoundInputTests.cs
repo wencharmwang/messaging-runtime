@@ -184,6 +184,29 @@ public sealed class ConversationListLocatorTests
 public sealed class WeChatLayoutTests
 {
     [Theory]
+    [InlineData(30, 46, 65)]
+    [InlineData(250, 237, 216)]
+    public void ReadyLayoutAllowsUniformEmptyComposer(int background, int sidebar, int border)
+    {
+        using var frame = new Bitmap(1100, 960);
+        using (var g = Graphics.FromImage(frame))
+        {
+            g.Clear(Color.FromArgb(background, background, background));
+            using var brush = new SolidBrush(Color.FromArgb(sidebar, sidebar, sidebar));
+            g.FillRectangle(brush, 0, 0, 500, 960);
+            using var pen = new Pen(Color.FromArgb(border, border, border));
+            g.DrawLine(pen, 500, 100, 1099, 100);
+            g.DrawLine(pen, 510, 790, 1090, 790);
+        }
+        var layout = WeChatLayout.Detect(frame, 120);
+        Assert.True(layout.HasOpenConversation);
+        // This is a ready editor even though every pixel has exactly one colour.
+        for (var y = layout.Composer.Top; y < layout.Composer.Bottom; y++)
+        for (var x = layout.Composer.Left; x < layout.Composer.Right; x++)
+            Assert.Equal(background, frame.GetPixel(x, y).R);
+    }
+
+    [Theory]
     [InlineData(1100,960,350,120)]
     [InlineData(1450,1000,430,120)]
     [InlineData(1650,1440,525,180)]
