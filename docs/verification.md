@@ -1,6 +1,6 @@
 # Messaging Runtime 0.1 交付记录
 
-日期：2026-09-03。工作目录：`C:/Users/Wencharm/Documents/projects/messaging-runtime`。
+日期：2026-09-03。工作目录：`C:/Users/<你>/Documents/projects/messaging-runtime`。
 
 ## 已交付
 

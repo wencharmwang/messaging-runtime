@@ -4,8 +4,8 @@
 
 ## 配置位置
 
-- Codex：`C:\Users\Wencharm\.codex\config.toml`，`mcp_servers.messaging-runtime`。
-- WorkBuddy：`C:\Users\Wencharm\.workbuddy\mcp.json`，`mcpServers.messaging-runtime`。
+- Codex：`C:\Users\<你>\.codex\config.toml`，`mcp_servers.messaging-runtime`。
+- WorkBuddy：`C:\Users\<你>\.workbuddy\mcp.json`，`mcpServers.messaging-runtime`。
 - 本机客户端 JSON：项目根目录下 `.runtime-data/mcp-client.local.json` 与 `.runtime-data/mcp-client.http.local.json`。
 - 服务启动参数及令牌：项目根目录下 `.runtime-data/shared-service.json`。令牌仅保存在本机配置中，不要提交或分享这些文件。
 - Runtime 业务配置：`config/messaging-runtime.example.json`。当前发送模式为 `user_directed`，`approval_ui=desktop`。
