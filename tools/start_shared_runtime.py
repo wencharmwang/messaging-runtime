@@ -220,9 +220,21 @@ def main():
                 raise DesktopNotReady(detail)
             env = os.environ.copy()
             env['MESSAGING_RUNTIME_TOKEN'] = settings['token']
-            command = [settings['dotnet'], str(ROOT / 'artifacts/app/messaging-runtime.dll'),
-                       '--http', '--port', str(settings['port']),
-                       '--config', settings['config']]
+            # 两种交付形态都要能起：
+            #   * 自包含（交付给客户的形态）：artifacts/app 里有 coreclr.dll，
+            #     直接用 apphost —— **客户机不需要装 .NET**；
+            #   * 框架依赖（本机开发）：用 settings 里的 dotnet + dll。
+            app_dir = ROOT / 'artifacts/app'
+            apphost = app_dir / 'messaging-runtime.exe'
+            if apphost.exists() and (app_dir / 'coreclr.dll').exists():
+                launcher: list[str] = []
+                program = str(apphost)
+            else:
+                launcher = [settings['dotnet']]
+                program = str(app_dir / 'messaging-runtime.dll')
+            command = launcher + [program,
+                                  '--http', '--port', str(settings['port']),
+                                  '--config', settings['config']]
             with (DATA / 'shared-service.log').open('ab') as log:
                 process = subprocess.Popen(command, cwd=ROOT, env=env, stdin=subprocess.DEVNULL,
                                            stdout=log, stderr=log, close_fds=True,

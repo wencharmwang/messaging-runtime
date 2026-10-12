@@ -1,8 +1,13 @@
-param([switch]$SkipBuild)
+﻿param(
+  [switch]$SkipBuild,
+  # 交付给客户时带上这个：把 .NET 运行时一起打进去，客户机不用装 .NET。
+  # 用它就不需要客户机有任何前置（除了微信本身）。
+  [switch]$SelfContained
+)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'runtime-paths.ps1')
 if (-not $SkipBuild) {
-    & (Join-Path $PSScriptRoot 'build.ps1') -Publish
+    & (Join-Path $PSScriptRoot 'build.ps1') -Publish -SelfContained:$SelfContained
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 $appPath = Join-Path $MessagingProjectRoot 'artifacts/app'
