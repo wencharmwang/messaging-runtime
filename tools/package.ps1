@@ -60,6 +60,25 @@ if ($pins.Count -eq 0) {
 Write-Output ("GPU 清单：tools/gpu-requirements.txt（{0} 项）" -f $pins.Count)
 
 if ($SkipGpu) {
+  # 换 CPU 版要用**带 pip、且次版本与包里一致**的解释器。
+  # 踩过两次：
+  #   1) 包里的 embeddable 没有 pip —— 用它必然失败；
+  #   2) PATH 上的 python 可能是 3.14 —— 那拿不到 cp313 的 wheel，装出来的东西
+  #      在包里的 3.13 上根本 import 不了。
+  # 所以首选**消息运行时自带的那个 python**（3.13，且带 pip）。
+  $pipPython = $null
+  $bundled = Join-Path $MessagingProjectRoot 'runtime\python\python.exe'
+  $candidates = @($bundled)
+  foreach ($name in @('python', 'py')) {
+    $found = Get-Command $name -ErrorAction SilentlyContinue
+    if ($found -and $found.Source) { $candidates += $found.Source }
+  }
+  foreach ($candidate in $candidates) {
+    if (-not (Test-Path -LiteralPath $candidate)) { continue }
+    $probe = & $candidate -c "import pip,sys; print(sys.version_info.minor)" 2>&1
+    if ($LASTEXITCODE -eq 0 -and "$probe" -match '^13$') { $pipPython = $candidate; break }
+  }
+  if (-not $pipPython) { throw '找不到 3.13 且带 pip 的解释器，无法把 onnxruntime 换成 CPU 版。' }
   $nvidiaDir = Join-Path $sitePackages 'nvidia'
   if (Test-Path -LiteralPath $nvidiaDir) {
     $before = [math]::Round(((Get-ChildItem -LiteralPath $nvidiaDir -Recurse -File | Measure-Object Length -Sum).Sum / 1MB), 0)
@@ -75,8 +94,13 @@ if ($SkipGpu) {
   $log = Join-Path $env:TEMP 'gpu-swap-cpu.log'
   $previous = $ErrorActionPreference
   $ErrorActionPreference = 'Continue'   # pip 会往 stderr 写进度，Stop 会把它当致命错误
-  & $pkgPython -m pip install --target $sitePackages --only-binary :all: --upgrade 'onnxruntime==1.22.0' 2>&1 |
+  # 清掉从外部继承的 PYTHONPATH：构建不该受调用方环境影响
+  # （实测：某个环境往 PYTHONPATH 里塞了 sitecustomize，pip 就被它拦住了）。
+  $savedPath = $env:PYTHONPATH
+  $env:PYTHONPATH = ''
+  & $pipPython -m pip install --target $sitePackages --only-binary :all: --upgrade 'onnxruntime==1.22.0' 2>&1 |
     ForEach-Object { Add-Content -LiteralPath $log -Value $_ }
+  $env:PYTHONPATH = $savedPath
   $pipCode = $LASTEXITCODE
   $ErrorActionPreference = $previous
   if ($pipCode -ne 0) { throw "把 onnxruntime 换成 CPU 版失败，见 $log" }
