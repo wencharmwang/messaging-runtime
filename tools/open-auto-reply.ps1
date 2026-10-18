@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 $taskRoot = Split-Path $PSScriptRoot -Parent
 $taskConfig = Get-Content -LiteralPath (Join-Path $taskRoot '.runtime-data\auto-reply\config.json') -Raw | ConvertFrom-Json
 $taskToken = (Get-Content -LiteralPath $taskConfig.control_token_file -Raw).Trim()

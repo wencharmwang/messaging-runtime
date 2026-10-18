@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$HarnessRoot = 'C:\Users\Wencharm\Documents\projects\deepseek-harness',
     [string]$NodeExecutable,
     [switch]$PrepareOnly

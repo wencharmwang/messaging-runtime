@@ -1,4 +1,4 @@
-$MessagingProjectRoot = Split-Path -Parent $PSScriptRoot
+﻿$MessagingProjectRoot = Split-Path -Parent $PSScriptRoot
 function Get-MessagingDotnet {
     $command = Get-Command dotnet -ErrorAction SilentlyContinue
     if ($command) { return $command.Source }

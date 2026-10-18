@@ -1,4 +1,4 @@
-param([switch]$Force)
+﻿param([switch]$Force)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'runtime-paths.ps1')
 $clientFile = Join-Path $MessagingProjectRoot '.runtime-data/mcp-client.local.json'
